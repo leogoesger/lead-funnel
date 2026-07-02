@@ -2,7 +2,7 @@
 
 A lightweight AI-powered lead management and chat system built in Go using **Kronk**, **RAG (Retrieval-Augmented Generation)**, and streaming LLMs.
 
-This system is designed for a real-world daycare workflow where parents can text a single number, ask questions, and eventually be guided toward booking a tour — while the system tracks, ranks, and follows up with leads automatically.
+This system is designed for a real-world lead funnel workflow where contacts can text a single number, ask questions, and eventually be guided toward the end of the funnel — while the system tracks, ranks, and follows up with leads automatically.
 
 ---
 
@@ -112,7 +112,7 @@ Uses Kronk chat streaming API:
 
 Stores:
 
-- Parent contact info
+- Contact info
 - Conversation history
 - Lead status (new / warm / cold / converted)
 - Interaction timestamps
