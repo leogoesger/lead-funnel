@@ -105,6 +105,7 @@ func (a *app) test(ctx context.Context, r *http.Request) web.Encoder {
 		default:
 			if resp.Choices[0].Delta.Reasoning != "" {
 				reason.WriteString(resp.Choices[0].Delta.Reasoning)
+				continue
 			}
 			if resp.Choices[0].Delta.Content != "" {
 				answer.WriteString(resp.Choices[0].Delta.Content)
