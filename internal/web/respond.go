@@ -85,19 +85,27 @@ func Respond(ctx context.Context, w http.ResponseWriter, resp Encoder) error {
 
 // ErrorResponse wraps an error and implements the Encoder interface
 type ErrorResponse struct {
-	Error  string `json:"error"`
-	Status int    `json:"status"`
+	Error   error  `json:"error"`
+	Message string `json:"message,omitempty"`
+	Status  int    `json:"status"`
 }
 
 func (e ErrorResponse) Encode() (data []byte, contentType string, err error) {
-	data, err = json.Marshal(e)
+	data, err = json.Marshal(map[string]any{
+		"error":   e.Error.Error(),
+		"message": e.Message,
+	})
 	return data, "application/json", err
+}
+
+func (e ErrorResponse) HTTPStatus() int {
+	return e.Status
 }
 
 // SuccessResponse wraps a success message and data
 type SuccessResponse struct {
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
+	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 func (s SuccessResponse) Encode() (data []byte, contentType string, err error) {

@@ -4,7 +4,9 @@ import (
 	"net/http"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/leogoesger/lead-funnel/internal/llm"
 	"github.com/leogoesger/lead-funnel/internal/logger"
+	"github.com/leogoesger/lead-funnel/internal/rag"
 )
 
 // Options represent optional parameters.
@@ -20,8 +22,10 @@ func WithCORS(origins []string) func(opts *Options) {
 }
 
 type MuxConfig struct {
-	Log *logger.Logger
-	DB  *sqlx.DB
+	Log       *logger.Logger
+	DB        *sqlx.DB
+	LLMClient *llm.Client
+	RagClient rag.Client
 }
 
 type RouteAdder interface {
