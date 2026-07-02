@@ -2,15 +2,11 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
-	"github.com/ardanlabs/kronk/sdk/kronk/model"
 	"github.com/jmoiron/sqlx"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/leogoesger/lead-funnel/internal/config"
@@ -49,7 +45,7 @@ func run(ctx context.Context) int {
 	}
 	defer db.Close()
 
-	ragSystem, err := initRagSystem(ctx, &cfg)
+	ragClient, err := initRagClient(ctx, &cfg)
 	if err != nil {
 		log.Error(ctx, "unable to create RAG system", "err", err)
 		return 1
@@ -61,17 +57,14 @@ func run(ctx context.Context) int {
 		return 1
 	}
 
-	if err := testllm(ctx, llmClient, log, ragSystem); err != nil {
-		log.Error(ctx, "unable to test LLM client", "err", err)
-		return 1
-	}
-
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 
 	cfgMux := web.MuxConfig{
-		Log: log,
-		DB:  db,
+		Log:       log,
+		DB:        db,
+		LLMClient: llmClient,
+		RagClient: ragClient,
 	}
 
 	webAPI := web.WebAPI(cfgMux,
@@ -139,7 +132,7 @@ func initDB(cfg *config.ServiceAPI) (*sqlx.DB, error) {
 	return db, nil
 }
 
-func initRagSystem(ctx context.Context, cfg *config.ServiceAPI) (rag.RAG, error) {
+func initRagClient(ctx context.Context, cfg *config.ServiceAPI) (rag.Client, error) {
 	embedder, err := rag.NewKronkEmbedder(ctx, cfg.Rag)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to create RAG embedder")
@@ -147,16 +140,16 @@ func initRagSystem(ctx context.Context, cfg *config.ServiceAPI) (rag.RAG, error)
 
 	vectorStore := rag.NewInMemoryVectorStore(cfg.Rag)
 
-	ragSystem, err := rag.NewRAG(vectorStore, embedder, cfg.Rag)
+	ragClient, err := rag.NewRAG(vectorStore, embedder, cfg.Rag)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to create RAG system")
 	}
 
-	if err := ragSystem.LoadDocuments(ctx); err != nil {
+	if err := ragClient.LoadDocuments(ctx); err != nil {
 		return nil, errors.Wrap(err, "unable to load documents")
 	}
 
-	return ragSystem, nil
+	return ragClient, nil
 }
 
 func initLLM(ctx context.Context, cfg *config.ServiceAPI) (*llm.Client, error) {
@@ -166,88 +159,4 @@ func initLLM(ctx context.Context, cfg *config.ServiceAPI) (*llm.Client, error) {
 	}
 
 	return llmClient, nil
-}
-
-func testllm(ctx context.Context, llmClient *llm.Client, log *logger.Logger, ragSystem rag.RAG) error {
-	question := "What is your address?"
-	results, err := ragSystem.Query(ctx, question, 3)
-	if err != nil {
-		return errors.Wrap(err, "query RAG system")
-	}
-
-	messages := []model.D{
-		model.TextMessage("user", question),
-	}
-
-	d := model.D{
-		"messages":    addContextPrompt(results, messages),
-		"max_tokens":  2048,
-		"temperature": 0.7,
-		"top_p":       0.9,
-		"top_k":       40,
-	}
-
-	streamCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
-
-	ch, err := llmClient.ChatStreaming(streamCtx, d)
-	if err != nil {
-		return errors.Wrap(err, "chat streaming")
-	}
-
-	var reason strings.Builder
-	var answer strings.Builder
-	for resp := range ch {
-		switch resp.Choices[0].FinishReason() {
-		case model.FinishReasonError:
-			return errors.New("chat streaming error: " + resp.Choices[0].Delta.Content)
-
-		case model.FinishReasonStop:
-			log.Info(ctx, "reasoning", "reason", reason.String())
-
-		default:
-			if resp.Choices[0].Delta.Reasoning != "" {
-				reason.WriteString(resp.Choices[0].Delta.Reasoning)
-			}
-
-			if resp.Choices[0].Delta.Content != "" {
-				answer.WriteString(resp.Choices[0].Delta.Content)
-			}
-		}
-	}
-	log.Info(ctx, "chat streaming answer", "answer", answer.String())
-	return nil
-}
-
-func addContextPrompt(documents []rag.QueryResult, messages []model.D) []model.D {
-	const prompt = `
-		- Use the following Context to answer the user's question.
-		- If you don't know the answer, say that you don't know.
-		- Responses should be properly formatted to be easily read.
-		- Share code if code is presented in the context.
-		- Do not include any additional information not present in the context.
-
-		Context:
-		
-		%s
-
-		Question: %s
-		`
-
-	var count int
-	var content strings.Builder
-	for _, doc := range documents {
-		content.WriteString(fmt.Sprintf("%s\n\n", doc.Chunk.Content))
-		count++
-		if count == 2 {
-			break
-		}
-	}
-
-	lastUserInput := messages[len(messages)-1]["content"].(string)
-	finalPrompt := fmt.Sprintf(prompt, content.String(), lastUserInput)
-
-	messages = append(messages, model.TextMessage("user", finalPrompt))
-
-	return messages
 }

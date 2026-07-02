@@ -65,13 +65,11 @@ func MidErrors(log *logger.Logger) MidFunc {
 				return resp
 			}
 
-			_, span := otel.AddSpan(ctx, "app.mid.error")
-			span.RecordError(err)
-			defer span.End()
+			log.Error(ctx, "error", "err", err.Error())
 
 			// Return error as an ErrorResponse that implements Encoder
 			return ErrorResponse{
-				Error:  err.Error(),
+				Error:  err,
 				Status: http.StatusInternalServerError,
 			}
 		}

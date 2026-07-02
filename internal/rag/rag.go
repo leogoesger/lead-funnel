@@ -40,8 +40,8 @@ type QueryResult struct {
 	DocSource string  `json:"doc_source"`
 }
 
-// RAG is the main interface for the RAG system
-type RAG interface {
+// Client is the main interface for the RAG system
+type Client interface {
 	// Document operations
 	ProcessDocument(ctx context.Context, reader io.Reader, filename string, metadata map[string]string) (*Document, error)
 	StoreDocument(ctx context.Context, doc *Document) error
@@ -92,7 +92,7 @@ type ragImpl struct {
 }
 
 // NewRAG creates a new RAG instance
-func NewRAG(vectorStore VectorStore, embedder Embedder, cfg *Config) (RAG, error) {
+func NewRAG(vectorStore VectorStore, embedder Embedder, cfg *Config) (Client, error) {
 	r := &ragImpl{
 		loaders:     make(map[string]DocumentLoader),
 		vectorStore: vectorStore,

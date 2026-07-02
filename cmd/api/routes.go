@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/leogoesger/lead-funnel/cmd/api/contactapp"
 	"github.com/leogoesger/lead-funnel/cmd/api/healthapp"
 	"github.com/leogoesger/lead-funnel/internal/web"
 )
@@ -16,5 +17,12 @@ func (all) Add(app *web.App, cfg web.MuxConfig) {
 	healthapp.Routes(app, &healthapp.Config{
 		Log: cfg.Log,
 		DB:  cfg.DB,
+	})
+
+	contactapp.Routes(app, &contactapp.Config{
+		Log:       cfg.Log,
+		DB:        cfg.DB,
+		LLMClient: cfg.LLMClient,
+		RagClient: cfg.RagClient,
 	})
 }
