@@ -27,5 +27,3 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Dependencies
-vendor/

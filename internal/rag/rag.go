@@ -115,26 +115,20 @@ func (r *ragImpl) LoadDocuments(ctx context.Context) error {
 		return fmt.Errorf("failed to list files in %s: %w", r.docsPath, err)
 	}
 
-	fmt.Printf("Found %d files to load\n", len(files))
-
 	for _, filePath := range files {
-		fmt.Printf("Loading file: %s\n", filePath)
 		file, err := os.Open(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to open file %s: %w", filePath, err)
 		}
-		fmt.Printf("Processing document: %s\n", filePath)
 		doc, err := r.ProcessDocument(ctx, file, filepath.Base(filePath), nil)
 		if err != nil {
 			file.Close()
 			return fmt.Errorf("failed to process document %s: %w", filePath, err)
 		}
-		fmt.Printf("Storing document: %s\n", filePath)
 		if err := r.StoreDocument(ctx, doc); err != nil {
 			file.Close()
 			return fmt.Errorf("failed to store document %s: %w", filePath, err)
 		}
-		fmt.Printf("Completed: %s\n", filePath)
 		file.Close()
 	}
 	return nil

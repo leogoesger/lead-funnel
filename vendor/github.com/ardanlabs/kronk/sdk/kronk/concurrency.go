@@ -1,0 +1,160 @@
+package kronk
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/ardanlabs/kronk/sdk/kronk/model"
+)
+
+const streamChBuffer = 32
+
+type nonStreamingFunc[T any] func(llama *model.Model) (T, error)
+
+func nonStreaming[T any](ctx context.Context, krn *Kronk, f nonStreamingFunc[T]) (T, error) {
+	var zero T
+
+	mdl, err := krn.acquireModel(ctx)
+	if err != nil {
+		return zero, err
+	}
+	defer krn.releaseModel()
+
+	return f(mdl)
+}
+
+// =============================================================================
+
+type streamingFunc[T any] func(llama *model.Model) <-chan T
+type errorFunc[T any] func(err error) T
+
+func streaming[T any](ctx context.Context, krn *Kronk, f streamingFunc[T], ef errorFunc[T]) (<-chan T, error) {
+	mdl, err := krn.acquireModel(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ch := make(chan T, streamChBuffer)
+
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				sendError(ch, ef, rec)
+			}
+
+			// Release the model BEFORE closing the channel. The HTTP
+			// handler (and any caller ranging over ch) unblocks on
+			// close, so the request is considered done by the caller
+			// the instant close fires. The pool's evictOneIdle reads
+			// krn.ActiveStreams() once and returns ErrServerBusy when
+			// it's still nonzero (no retry, no poll) — closing before
+			// releasing leaves a race window where the next sequential
+			// request against a one-slot pool can flake with
+			// "no idle pool entry available to evict".
+			krn.releaseModel()
+			close(ch)
+		}()
+
+		lch := f(mdl)
+
+		var cancelled bool
+		for msg := range lch {
+			if err := sendMessage(ctx, ch, msg); err != nil {
+				cancelled = true
+				break
+			}
+		}
+
+		if cancelled {
+			sendError(ch, ef, ctx.Err())
+		}
+	}()
+
+	return ch, nil
+}
+
+func sendMessage[T any](ctx context.Context, ch chan T, msg T) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+
+	case ch <- msg:
+		return nil
+	}
+}
+
+func sendError[T any](ch chan T, ef errorFunc[T], rec any) {
+	select {
+	case ch <- ef(fmt.Errorf("%v", rec)):
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// =============================================================================
+
+type streamProcessor[T, U any] struct {
+	Start    func() []U
+	Process  func(T) []U
+	Complete func(T) []U
+}
+
+func streamingWith[T, U any](ctx context.Context, krn *Kronk, f streamingFunc[T], p streamProcessor[T, U], ef errorFunc[U]) (<-chan U, error) {
+	mdl, err := krn.acquireModel(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	ch := make(chan U, streamChBuffer)
+
+	go func() {
+		var cancelled bool
+
+		defer func() {
+			if rec := recover(); rec != nil {
+				sendError(ch, ef, rec)
+			}
+
+			if cancelled {
+				sendError(ch, ef, ctx.Err())
+			}
+
+			// Release the model BEFORE closing the channel — same
+			// rationale as in streaming() above: the pool reads
+			// krn.ActiveStreams() once with no retry, so back-to-back
+			// requests against a one-slot pool flake if release runs
+			// after close.
+			krn.releaseModel()
+			close(ch)
+		}()
+
+		for _, msg := range p.Start() {
+			if err := sendMessage(ctx, ch, msg); err != nil {
+				cancelled = true
+				return
+			}
+		}
+
+		lch := f(mdl)
+
+		var lastChunk T
+		for chunk := range lch {
+			lastChunk = chunk
+			for _, msg := range p.Process(chunk) {
+				if err := sendMessage(ctx, ch, msg); err != nil {
+					cancelled = true
+					return
+				}
+			}
+		}
+
+		for _, msg := range p.Complete(lastChunk) {
+			if err := sendMessage(ctx, ch, msg); err != nil {
+				cancelled = true
+				return
+			}
+		}
+	}()
+
+	return ch, nil
+}

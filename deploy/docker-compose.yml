@@ -1,0 +1,53 @@
+services:
+  funneldb:
+    image: postgres:18.4-alpine
+    container_name: lead-funnel-postgres
+    environment:
+      POSTGRES_DB: lead_funnel
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d lead_funnel"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lead-funnel-network
+
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: lead-funnel-api
+    depends_on:
+      funneldb:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../migrations:/root/migrations
+      - ../static:/root/static
+      - ~/.kronk/models:/root/.kronk/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - lead-funnel-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  lead-funnel-network:
+    driver: bridge

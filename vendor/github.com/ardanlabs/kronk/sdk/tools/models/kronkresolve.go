@@ -1,0 +1,271 @@
+package models
+
+import (
+	"fmt"
+	"path/filepath"
+
+	"github.com/ardanlabs/kronk/sdk/kronk/model"
+	"github.com/ardanlabs/kronk/sdk/tools/devices"
+)
+
+// KronkResolvedConfig builds a model.Config for kronk.New() using the new
+// resolution flow: analysis defaults (layer 1) overridden by user-supplied
+// model_config.yaml entries (layer 3), then sampling defaults via
+// SamplingConfig.WithDefaults(), grammar resolution, and on-disk file paths.
+//
+// The catalog YAML middle layer used by the legacy resolution path is not
+// applied here.
+func (m *Models) KronkResolvedConfig(modelID string, mc map[string]ModelConfig) (model.Config, error) {
+
+	// Confirm the model is on disk before resolving anything else.
+	fp, err := m.FullPath(modelID)
+	if err != nil {
+		return model.Config{}, fmt.Errorf("kronk-resolved-config: unable to get model[%s] path: %w", modelID, err)
+	}
+
+	// Layer 1: hardware-aware defaults derived from the GGUF file metadata.
+	cfg := m.AnalysisDefaults(modelID)
+
+	// Layer 3: user overrides from model_config.yaml.
+	if override, ok := mc[modelID]; ok {
+		MergeModelConfig(&cfg, override)
+	}
+
+	// Resolve grammar (.grm filename -> contents) before converting.
+	if err := m.ResolveGrammar(&cfg.Sampling); err != nil {
+		return model.Config{}, fmt.Errorf("kronk-resolved-config: %w", err)
+	}
+
+	// Convert to model.Config and attach on-disk paths.
+	out := cfg.ToKronkConfig()
+	out.ModelFiles = fp.ModelFiles
+	out.ProjFile = fp.ProjFile
+
+	// fp.MTPFile is the on-disk path to the separate-file MTP assistant
+	// drafter companion (e.g. Gemma4's "mtp-*.gguf"), discovered by the
+	// download/catalog layer. The runtime config calls it MTPDrafterFile to
+	// avoid confusion with MTP-capable MAIN models (whose own filenames
+	// also start with "mtp-", e.g. mtp-Qwen3.6-...).
+	out.MTPDrafterFile = fp.MTPFile
+
+	// Resolve a relative jinja template path against the kronk base
+	// directory so users can write portable values like
+	// "jinja/Qwen3.5-0.8B-Q8_0.jinja" in model_config.yaml without
+	// needing OS-specific home expansion.
+	if out.JinjaFile != "" && !filepath.IsAbs(out.JinjaFile) {
+		out.JinjaFile = filepath.Join(m.basePath, out.JinjaFile)
+	}
+
+	// Resolve draft model file paths if configured.
+	if cfg.DraftModel != nil && cfg.DraftModel.ModelID != "" {
+		draftPath, err := m.FullPath(cfg.DraftModel.ModelID)
+		if err != nil {
+			return model.Config{}, fmt.Errorf("kronk-resolved-config: unable to get draft model[%s] path: %w", cfg.DraftModel.ModelID, err)
+		}
+
+		if out.DraftModel == nil {
+			out.DraftModel = &model.DraftModelConfig{}
+		}
+
+		out.DraftModel.ModelFiles = draftPath.ModelFiles
+	}
+
+	return out, nil
+}
+
+// AutoTune is the single source of analysis-derived defaults. It analyzes the
+// given model facts against the available hardware and returns the recommended
+// settings as a ModelConfig. Both the model pool (via AnalysisDefaults /
+// KronkResolvedConfig) and the SDK auto-tune path (kronk.New with WithAutoTune)
+// call it so the two never seed defaults differently. Callers overlay their own
+// explicit settings on top of the returned config.
+func AutoTune(info ModelInfo, devs devices.Devices) (ModelConfig, error) {
+	analysis, err := Analyze(info, devs)
+	if err != nil {
+		return ModelConfig{}, fmt.Errorf("auto-tune: %w", err)
+	}
+
+	rec := analysis.Recommended
+
+	var cfg ModelConfig
+
+	// NBatch and NUBatch are intentionally left unset here so the load-time
+	// adjustConfig (the single source of batch sizing) derives them: NUBatch
+	// defaults to 2048 and NBatch to NUBatch * NSeqMax.
+	cfg.PtrContextWindow = new(int(rec.ContextWindow))
+	cfg.PtrNSeqMax = new(int(rec.NSeqMax))
+
+	if k, err := model.ParseGGMLType(rec.CacheTypeK); err == nil {
+		cfg.CacheTypeK = k
+	}
+
+	if v, err := model.ParseGGMLType(rec.CacheTypeV); err == nil {
+		cfg.CacheTypeV = v
+	}
+
+	switch rec.FlashAttention {
+	case "auto":
+		cfg.FlashAttention = new(model.FlashAttentionAuto)
+	case "disabled":
+		cfg.FlashAttention = new(model.FlashAttentionDisabled)
+	default:
+		cfg.FlashAttention = new(model.FlashAttentionEnabled)
+	}
+
+	// Set the hardware-aware split mode so the resolved config is explicit
+	// rather than relying on the in-load default (which uses the same rule).
+	if sm, err := model.ParseSplitMode(rec.SplitMode); err == nil && rec.SplitMode != "" {
+		cfg.PtrSplitMode = &sm
+	}
+
+	// model.Config: PtrNGpuLayers nil = all on GPU, 0 = all on GPU, -1 = all on CPU.
+	// Only set when we explicitly want CPU-only.
+	if rec.NGPULayers < 0 {
+		n := int(rec.NGPULayers)
+		cfg.PtrNGpuLayers = &n
+	}
+
+	return cfg, nil
+}
+
+// AnalysisDefaults runs the hardware analysis on a catalog model and returns
+// the recommended settings as a ModelConfig. It is the catalog/modelID-based
+// entry point onto the shared AutoTune logic. If the model is not downloaded or
+// analysis fails, an empty ModelConfig is returned.
+func (m *Models) AnalysisDefaults(modelID string) ModelConfig {
+	info, err := m.ModelInformation(modelID)
+	if err != nil {
+		return ModelConfig{}
+	}
+
+	cfg, err := AutoTune(info, devices.List())
+	if err != nil {
+		return ModelConfig{}
+	}
+
+	return cfg
+}
+
+// MergeModelConfig overlays non-zero fields from src onto dst.
+func MergeModelConfig(dst *ModelConfig, src ModelConfig) {
+	if src.Template != "" {
+		dst.Template = src.Template
+	}
+	if src.PtrContextWindow != nil {
+		dst.PtrContextWindow = src.PtrContextWindow
+	}
+	if src.PtrNBatch != nil {
+		dst.PtrNBatch = src.PtrNBatch
+	}
+	if src.PtrNUBatch != nil {
+		dst.PtrNUBatch = src.PtrNUBatch
+	}
+	if src.PtrNThreads != nil {
+		dst.PtrNThreads = src.PtrNThreads
+	}
+	if src.PtrNThreadsBatch != nil {
+		dst.PtrNThreadsBatch = src.PtrNThreadsBatch
+	}
+	if src.CacheTypeK != 0 {
+		dst.CacheTypeK = src.CacheTypeK
+	}
+	if src.CacheTypeV != 0 {
+		dst.CacheTypeV = src.CacheTypeV
+	}
+	if src.FlashAttention != nil {
+		dst.FlashAttention = src.FlashAttention
+	}
+	if src.PtrUseDirectIO != nil {
+		dst.PtrUseDirectIO = src.PtrUseDirectIO
+	}
+	if src.PtrUseMMap != nil {
+		dst.PtrUseMMap = src.PtrUseMMap
+	}
+	if src.NUMA != "" {
+		dst.NUMA = src.NUMA
+	}
+	if src.PtrNSeqMax != nil {
+		dst.PtrNSeqMax = src.PtrNSeqMax
+	}
+	if src.PtrOffloadKQV != nil {
+		dst.PtrOffloadKQV = src.PtrOffloadKQV
+	}
+	if src.PtrOpOffload != nil {
+		dst.PtrOpOffload = src.PtrOpOffload
+	}
+	if src.PtrOpOffloadMinBatch != nil {
+		dst.PtrOpOffloadMinBatch = src.PtrOpOffloadMinBatch
+	}
+	if src.PtrNGpuLayers != nil {
+		dst.PtrNGpuLayers = src.PtrNGpuLayers
+	}
+	if src.PtrSplitMode != nil {
+		dst.PtrSplitMode = src.PtrSplitMode
+	}
+	if len(src.TensorSplit) > 0 {
+		dst.TensorSplit = src.TensorSplit
+	}
+	if len(src.TensorBuftOverrides) > 0 {
+		dst.TensorBuftOverrides = src.TensorBuftOverrides
+	}
+	if src.PtrMainGPU != nil {
+		dst.PtrMainGPU = src.PtrMainGPU
+	}
+	if len(src.Devices) > 0 {
+		dst.Devices = src.Devices
+	}
+	if src.MoE != nil {
+		dst.MoE = src.MoE
+	}
+	if src.PtrSWAFull != nil {
+		dst.PtrSWAFull = src.PtrSWAFull
+	}
+	if src.PtrIncrementalCache != nil {
+		dst.PtrIncrementalCache = src.PtrIncrementalCache
+	}
+	if src.PtrCacheMinTokens != nil {
+		dst.PtrCacheMinTokens = src.PtrCacheMinTokens
+	}
+	if src.PtrCacheSlotTimeout != nil {
+		dst.PtrCacheSlotTimeout = src.PtrCacheSlotTimeout
+	}
+	if src.SessionStoreDir != "" {
+		dst.SessionStoreDir = src.SessionStoreDir
+	}
+	if src.SessionStoreKind != "" {
+		dst.SessionStoreKind = src.SessionStoreKind
+	}
+	if src.PtrInsecureLogging != nil {
+		dst.PtrInsecureLogging = src.PtrInsecureLogging
+	}
+	if src.RopeScaling != 0 {
+		dst.RopeScaling = src.RopeScaling
+	}
+	if src.PtrRopeFreqBase != nil {
+		dst.PtrRopeFreqBase = src.PtrRopeFreqBase
+	}
+	if src.PtrRopeFreqScale != nil {
+		dst.PtrRopeFreqScale = src.PtrRopeFreqScale
+	}
+	if src.PtrYarnExtFactor != nil {
+		dst.PtrYarnExtFactor = src.PtrYarnExtFactor
+	}
+	if src.PtrYarnAttnFactor != nil {
+		dst.PtrYarnAttnFactor = src.PtrYarnAttnFactor
+	}
+	if src.PtrYarnBetaFast != nil {
+		dst.PtrYarnBetaFast = src.PtrYarnBetaFast
+	}
+	if src.PtrYarnBetaSlow != nil {
+		dst.PtrYarnBetaSlow = src.PtrYarnBetaSlow
+	}
+	if src.PtrYarnOrigCtx != nil {
+		dst.PtrYarnOrigCtx = src.PtrYarnOrigCtx
+	}
+	if src.DraftModel != nil {
+		dst.DraftModel = src.DraftModel
+	}
+
+	// Merge sampling: src overrides non-zero fields in dst.
+	dst.Sampling = mergeSampling(dst.Sampling, src.Sampling)
+}

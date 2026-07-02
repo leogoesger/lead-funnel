@@ -1,0 +1,99 @@
+// Package defaults provides default values for the cli tooling.
+package defaults
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+
+	"github.com/ardanlabs/kronk/sdk/tools/devices"
+	"github.com/hybridgroup/yzma/pkg/download"
+)
+
+var (
+	basePath   = ".kronk"
+	libVersion = ""
+)
+
+// LibVersion returns the default library version, checking the KRONK_LIB_VERSION
+// env var first. If an override is provided, it takes precedence.
+func LibVersion(override string) string {
+	if override != "" {
+		return override
+	}
+
+	if v := os.Getenv("KRONK_LIB_VERSION"); v != "" {
+		return v
+	}
+
+	return libVersion
+}
+
+// BaseDir is the default base folder location for kronk files. The supplied
+// override wins; otherwise the KRONK_BASE_PATH environment variable is
+// consulted; otherwise the location falls back to $HOME/.kronk.
+func BaseDir(override string) string {
+	if override != "" {
+		return override
+	}
+
+	if v := os.Getenv("KRONK_BASE_PATH"); v != "" {
+		return v
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Sprintf("./%s", basePath)
+	}
+
+	return filepath.Join(homeDir, basePath)
+}
+
+// Arch will check the KRONK_ARCH var first and check it's value against the
+// proper set of architectures. If that variable is not set, then runtime.GOARCH
+// is used.
+func Arch(override string) (download.Arch, error) {
+	if override != "" {
+		return download.ParseArch(override)
+	}
+
+	if v := os.Getenv("KRONK_ARCH"); v != "" {
+		return download.ParseArch(v)
+	}
+
+	return download.ParseArch(runtime.GOARCH)
+}
+
+// OS will check the KRONK_OS var first and check it's value against the proper
+// set of operating systems. If that variable is not set, then runtime.GOOS
+//
+//	is used.
+func OS(override string) (download.OS, error) {
+	if override != "" {
+		return download.ParseOS(override)
+	}
+
+	if v := os.Getenv("KRONK_OS"); v != "" {
+		return download.ParseOS(v)
+	}
+
+	return download.ParseOS(runtime.GOOS)
+}
+
+// Processor will check the KRONK_PROCESSOR env var first and check it's value
+// against the proper set of processor values (cpu, cuda, metal, rocm, vulkan). If
+// that variable is not set, the system probes for available GPU hardware and
+// selects the best processor automatically. CPU is used only when no GPU is
+// detected.
+func Processor(override string) (download.Processor, error) {
+	if override != "" {
+		return download.ParseProcessor(override)
+	}
+
+	if v := os.Getenv("KRONK_PROCESSOR"); v != "" {
+		return download.ParseProcessor(v)
+	}
+
+	return devices.DetectGPU(), nil
+}

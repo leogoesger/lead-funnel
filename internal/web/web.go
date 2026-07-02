@@ -1,0 +1,317 @@
+package web
+
+import (
+	"context"
+	"embed"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
+)
+
+type Config struct {
+	ReadTimeout        time.Duration `default:"30s"`
+	WriteTimeout       time.Duration `default:"60m"`
+	IdleTimeout        time.Duration `default:"1m"`
+	ShutdownTimeout    time.Duration `default:"1m"`
+	APIHost            string        `default:"0.0.0.0:8080"`
+	CORSAllowedOrigins []string      `default:"*"`
+}
+
+type Logger func(ctx context.Context, msg string, args ...any)
+
+type App struct {
+	log     Logger
+	mux     *http.ServeMux
+	otmux   http.Handler
+	mw      []MidFunc
+	origins []string
+}
+
+func NewApp(log Logger, mw ...MidFunc) *App {
+	// Create an OpenTelemetry HTTP Handler which wraps our router. This will start
+	// the initial span and annotate it with information about the request/trusted.
+	//
+	// This is configured to use the W3C TraceContext standard to set the remote
+	// parent if a client request includes the appropriate headers.
+	// https://w3c.github.io/trace-context/
+
+	mux := http.NewServeMux()
+
+	return &App{
+		log:   log,
+		mux:   mux,
+		otmux: otelhttp.NewHandler(mux, "request"),
+		mw:    mw,
+	}
+}
+
+// MidFunc is a handler function designed to run code before and/or after
+// another Handler. It is designed to remove boilerplate or other concerns not
+// direct to any given app Handler.
+type MidFunc func(handler HandlerFunc) HandlerFunc
+
+// wrapMiddleware creates a new handler by wrapping middleware around a final
+// handler. The middlewares' Handlers will be executed by requests in the order
+// they are provided.
+func wrapMiddleware(mw []MidFunc, handler HandlerFunc) HandlerFunc {
+
+	// Loop backwards through the middleware invoking each one. Replace the
+	// handler with the new wrapped handler. Looping backwards ensures that the
+	// first middleware of the slice is the first to be executed by requests.
+	for i := len(mw) - 1; i >= 0; i-- {
+		mwFunc := mw[i]
+		if mwFunc != nil {
+			handler = mwFunc(handler)
+		}
+	}
+
+	return handler
+}
+
+type Encoder interface {
+	Encode() (data []byte, contentType string, err error)
+}
+
+type HandlerFunc func(ctx context.Context, r *http.Request) Encoder
+
+// ServeHTTP implements the http.Handler interface. It's the entry point for
+// all http traffic and allows the opentelemetry mux to run first to handle
+// tracing. The opentelemetry mux then calls the application mux to handle
+// application traffic. This was set up in the NewApp function.
+func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if a.origins != nil {
+
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Origin
+		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Origin
+		//
+		// Limiting the possible Access-Control-Allow-Origin values to a set of
+		// allowed origins requires code on the server side to check the value of
+		// the Origin request header, compare that to a list of allowed origins, and
+		// then if the Origin value is in the list, set the
+		// Access-Control-Allow-Origin value to the same value as the Origin.
+
+		reqOrigin := r.Header.Get("Origin")
+		for _, origin := range a.origins {
+			if origin == "*" || origin == reqOrigin {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
+
+		w.Header().Set("Access-Control-Allow-Methods", "POST, PATCH, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Handle pre-flight by sending a 200 OK response.
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+
+	// In the following example, max-age is set to 2 years, and is suffixed with
+	// preload, which is necessary for inclusion in all major web browsers' HSTS
+	// preload lists, like Chromium, Edge, and Firefox.
+	w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload")
+
+	a.otmux.ServeHTTP(w, r)
+}
+
+// EnableCORS enables CORS preflight requests to work. It prevents the
+// MethodNotAllowedHandler from being called.
+func (a *App) EnableCORS(origins []string) {
+	a.origins = origins
+}
+
+// HandlerFuncNoMid sets a handler function for a given HTTP method and path
+// pair to the application server mux. Does not include the application
+// middleware or OTEL tracing.
+func (a *App) HandlerFuncNoMid(method string, group string, path string, handlerFunc HandlerFunc) {
+	h := func(w http.ResponseWriter, r *http.Request) {
+		ctx := setWriter(r.Context(), w)
+
+		resp := handlerFunc(ctx, r)
+
+		if err := Respond(ctx, w, resp); err != nil {
+			a.log(ctx, "web-respond", "ERROR", err)
+			return
+		}
+	}
+
+	finalPath := path
+	if group != "" {
+		finalPath = "/" + group + path
+	}
+	finalPath = fmt.Sprintf("%s %s", method, finalPath)
+
+	a.mux.HandleFunc(finalPath, h)
+}
+
+// HandlerFunc sets a handler function for a given HTTP method and path pair
+// to the application server mux.
+func (a *App) HandlerFunc(method string, group string, path string, handlerFunc HandlerFunc, mw ...MidFunc) {
+	handlerFunc = wrapMiddleware(mw, handlerFunc)
+	handlerFunc = wrapMiddleware(a.mw, handlerFunc)
+
+	h := func(w http.ResponseWriter, r *http.Request) {
+		ctx := setTracer(r.Context(), otel.GetTracerProvider().Tracer(""))
+		ctx = setWriter(ctx, w)
+
+		spanName := fmt.Sprintf("%s %s", r.Method, r.URL.Path)
+		ctx, span := otel.GetTracerProvider().Tracer("").Start(ctx, spanName)
+		defer span.End()
+
+		traceID := trace.SpanFromContext(ctx).SpanContext().TraceID().String()
+		if traceID == defaultTraceID {
+			traceID = uuid.NewString()
+		}
+
+		ctx = setTraceID(ctx, traceID)
+
+		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(w.Header()))
+
+		resp := handlerFunc(ctx, r)
+
+		if err := Respond(ctx, w, resp); err != nil {
+			a.log(ctx, "web-respond", "ERROR", err)
+			return
+		}
+	}
+
+	finalPath := path
+	if group != "" {
+		finalPath = "/" + group + path
+	}
+	finalPath = fmt.Sprintf("%s %s", method, finalPath)
+
+	a.mux.HandleFunc(finalPath, h)
+}
+
+// RawHandlerFunc sets a raw handler function for a given HTTP method and path
+// pair to the application server mux.
+func (a *App) RawHandlerFunc(method string, group string, path string, rawHandlerFunc http.HandlerFunc, mw ...MidFunc) {
+	handlerFunc := func(ctx context.Context, r *http.Request) Encoder {
+		r = r.WithContext(ctx)
+		rawHandlerFunc(GetWriter(ctx), r)
+		return nil
+	}
+
+	handlerFunc = wrapMiddleware(mw, handlerFunc)
+	handlerFunc = wrapMiddleware(a.mw, handlerFunc)
+
+	h := func(w http.ResponseWriter, r *http.Request) {
+		ctx := setTracer(r.Context(), otel.GetTracerProvider().Tracer(""))
+		ctx = setWriter(ctx, w)
+
+		spanName := fmt.Sprintf("%s %s", r.Method, r.URL.Path)
+		ctx, span := otel.GetTracerProvider().Tracer("").Start(ctx, spanName)
+		defer span.End()
+
+		traceID := trace.SpanFromContext(ctx).SpanContext().TraceID().String()
+		if traceID == defaultTraceID {
+			traceID = uuid.NewString()
+		}
+
+		ctx = setTraceID(ctx, traceID)
+
+		otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(w.Header()))
+
+		handlerFunc(ctx, r)
+	}
+
+	finalPath := path
+	if group != "" {
+		finalPath = "/" + group + path
+	}
+	finalPath = fmt.Sprintf("%s %s", method, finalPath)
+
+	a.mux.HandleFunc(finalPath, h)
+}
+
+// FileServerReact starts a file server based on the specified file system and
+// directory inside that file system for a statically built react webapp.
+func (a *App) FileServerReact(static embed.FS, dir string, path string, apiPrefixes []string) error {
+	fileMatcher := regexp.MustCompile(`\.[a-zA-Z]*$`)
+	apiMatcher := regexp.MustCompile(`^/(` + joinPrefixes(apiPrefixes) + `)(/|$)`)
+
+	fSys, err := fs.Sub(static, dir)
+	if err != nil {
+		return fmt.Errorf("switching to static folder: %w", err)
+	}
+
+	fileServer := http.StripPrefix(path, http.FileServer(http.FS(fSys)))
+
+	h := func(w http.ResponseWriter, r *http.Request) {
+		if apiMatcher.MatchString(r.URL.Path) {
+			a.log(r.Context(), "not-found", "method", r.Method, "path", r.URL.Path, "remoteaddr", r.RemoteAddr)
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+
+		if !fileMatcher.MatchString(r.URL.Path) {
+			p, err := static.ReadFile(fmt.Sprintf("%s/index.html", dir))
+			if err != nil {
+				a.log(r.Context(), "FileServerReact", "index.html not found", "ERROR", err)
+				http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+				return
+			}
+
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(p)
+			return
+		}
+
+		fileServer.ServeHTTP(w, r)
+	}
+
+	a.mux.HandleFunc(fmt.Sprintf("GET %s", path), h)
+
+	return nil
+}
+
+func joinPrefixes(prefixes []string) string {
+	if len(prefixes) == 0 {
+		return ""
+	}
+	var result strings.Builder
+	result.WriteString(prefixes[0])
+	for _, p := range prefixes[1:] {
+		result.WriteString("|" + p)
+	}
+	return result.String()
+}
+
+// FileServer starts a file server based on the specified file system and
+// directory inside that file system.
+func (a *App) FileServer(static embed.FS, dir string, path string) error {
+	fSys, err := fs.Sub(static, dir)
+	if err != nil {
+		return fmt.Errorf("switching to static folder: %w", err)
+	}
+
+	fileServer := http.StripPrefix(path, http.FileServer(http.FS(fSys)))
+
+	a.mux.Handle(fmt.Sprintf("GET %s", path), fileServer)
+
+	return nil
+}
+
+// NotFoundHandler registers a catch-all handler that logs requests to
+// endpoints that are not configured in the server mux.
+func (a *App) NotFoundHandler() {
+	h := func(w http.ResponseWriter, r *http.Request) {
+		a.log(r.Context(), "not-found", "method", r.Method, "path", r.URL.Path, "remoteaddr", r.RemoteAddr)
+		http.Error(w, "Not Found", http.StatusNotFound)
+	}
+
+	a.mux.HandleFunc("/", h)
+}

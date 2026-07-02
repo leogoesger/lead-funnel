@@ -1,20 +1,19 @@
 package migrate
 
 import (
-	"context"
 	"database/sql"
 	"os"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/database/postgres"
-	"github.com/leogoesger/lead-funnel/internal/logger"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/pkg/errors"
 )
 
 type Config struct {
-	Name                    string `default:"contentmods" split_words:"true"`
-	MigrationFile           string `default:"file:///migrations" split_words:"true"`
+	Name                    string `default:"lead_funnel" split_words:"true"`
+	MigrationFile           string `default:"file://./migrations" split_words:"true"`
 	SeedFile                string `split_words:"true"`
 	DBReadyMaxCheckAttempts int    `default:"10" split_words:"true"`
 }
@@ -24,7 +23,6 @@ type migrationService struct {
 	db                      *sql.DB
 	migrate                 *migrate.Migrate
 	dbReadyMaxCheckAttempts int
-	log                     *logger.Logger
 }
 
 func New(cfg *Config, db *sql.DB) (*migrationService, error) {
@@ -51,41 +49,37 @@ func New(cfg *Config, db *sql.DB) (*migrationService, error) {
 	}, nil
 }
 
-func (s *migrationService) Migrate(ctx context.Context) error {
-	err := s.readyDB(ctx)
+func (s *migrationService) Migrate() error {
+	err := s.readyDB()
 	if err != nil {
 		return errors.Wrap(err, "ready db")
 	}
 
-	if err := s.migrateDB(ctx); err != nil {
+	if err := s.migrateDB(); err != nil {
 		return errors.Wrap(err, "migrate db")
 	}
 
 	return nil
 }
 
-func (s *migrationService) readyDB(ctx context.Context) error {
+func (s *migrationService) readyDB() error {
 	var pingError error
 	for attempts := 1; attempts <= s.dbReadyMaxCheckAttempts; attempts++ {
 		pingError = s.db.Ping()
 		if pingError == nil {
 			break
 		}
-		s.log.Info(ctx, "waiting for database to become ready")
 		time.Sleep(time.Duration(attempts) * time.Second)
 	}
 
 	return pingError
 }
 
-func (s *migrationService) migrateDB(ctx context.Context) error {
+func (s *migrationService) migrateDB() error {
 	err := s.migrate.Up()
 	if err != nil && err != migrate.ErrNoChange {
 		return errors.Wrap(err, "apply migrations")
 	}
-
-	ver, dirty, err := s.migrate.Version()
-	s.log.Info(ctx, "database version", "version", ver, "dirty", dirty, "error", err)
 
 	if s.cfg.SeedFile != "" {
 		seedScript, err := os.ReadFile(s.cfg.SeedFile)

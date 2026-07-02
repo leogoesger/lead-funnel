@@ -1,0 +1,391 @@
+// Package models provides support for tooling around model management.
+package models
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/ardanlabs/kronk/sdk/kronk/applog"
+	"github.com/ardanlabs/kronk/sdk/kronk/model"
+	"github.com/ardanlabs/kronk/sdk/tools/defaults"
+	"go.yaml.in/yaml/v2"
+)
+
+var (
+	localFolder = "models"
+	indexFile   = ".index.yaml"
+)
+
+// Models manages the model system.
+type Models struct {
+	basePath   string
+	modelsPath string
+	biMutex    sync.Mutex
+}
+
+// New constructs the models system using defaults paths.
+func New() (*Models, error) {
+	return NewWithPaths("")
+}
+
+// NewWithPaths constructs the models system, If the basePath is empty, the
+// default location is used.
+func NewWithPaths(basePath string) (*Models, error) {
+	basePath = defaults.BaseDir(basePath)
+
+	modelPath := filepath.Join(basePath, localFolder)
+
+	if err := os.MkdirAll(modelPath, 0755); err != nil {
+		return nil, fmt.Errorf("creating models directory: %w", err)
+	}
+
+	m := Models{
+		basePath:   basePath,
+		modelsPath: modelPath,
+	}
+
+	return &m, nil
+}
+
+// Path returns the location of the models path.
+func (m *Models) Path() string {
+	return m.modelsPath
+}
+
+// BasePath returns the kronk base directory the system was constructed with.
+func (m *Models) BasePath() string {
+	return m.basePath
+}
+
+// BuildIndex builds the model index for fast model access. When checkSHA is
+// true, all models are fully validated with SHA256 checks. When false,
+// previously validated models are trusted (used at KMS startup for speed).
+func (m *Models) BuildIndex(log applog.Logger, checkSHA bool) error {
+	currentIndex := m.loadIndex()
+
+	m.biMutex.Lock()
+	defer m.biMutex.Unlock()
+
+	if err := m.removeEmptyDirs(); err != nil {
+		return fmt.Errorf("remove-empty-dirs: %w", err)
+	}
+
+	entries, err := os.ReadDir(m.modelsPath)
+	if err != nil {
+		return fmt.Errorf("list-models: reading models directory: %w", err)
+	}
+
+	index := make(map[string]Path)
+
+	for _, orgEntry := range entries {
+		if !orgEntry.IsDir() {
+			continue
+		}
+
+		org := orgEntry.Name()
+
+		modelEntries, err := os.ReadDir(fmt.Sprintf("%s/%s", m.modelsPath, org))
+		if err != nil {
+			continue
+		}
+
+		for _, modelEntry := range modelEntries {
+			if !modelEntry.IsDir() {
+				continue
+			}
+
+			modelFamily := modelEntry.Name()
+
+			fileEntries, err := os.ReadDir(fmt.Sprintf("%s/%s/%s", m.modelsPath, org, modelFamily))
+			if err != nil {
+				continue
+			}
+
+			modelfiles := make(map[string][]string)
+			projFiles := make(map[string]string)
+			mtpFiles := make(map[string]string)
+
+			// dedicatedMTPRepo: a "*-MTP-GGUF" family directory holds
+			// standalone MTP models, so its "mtp-" files must NOT be
+			// treated as companions. Co-located "mtp-" files in any other
+			// family directory are drafter companions of a main model.
+			dedicatedMTPRepo := repoMatchesRenameRule(modelFamily)
+
+			var pendingMTP []string
+
+			for _, fileEntry := range fileEntries {
+				if fileEntry.IsDir() {
+					continue
+				}
+
+				name := fileEntry.Name()
+
+				if name == ".DS_Store" {
+					continue
+				}
+
+				if strings.HasPrefix(name, "mmproj") {
+					modelID := extractModelID(name[7:])
+					projFiles[modelID] = filepath.Join(m.modelsPath, org, modelFamily, fileEntry.Name())
+					continue
+				}
+
+				filePath := filepath.Join(m.modelsPath, org, modelFamily, fileEntry.Name())
+
+				if !dedicatedMTPRepo && modelIDCarriesRenameMarker(extractModelID(name)) {
+					pendingMTP = append(pendingMTP, filePath)
+					continue
+				}
+
+				modelID := extractModelID(fileEntry.Name())
+				modelfiles[modelID] = append(modelfiles[modelID], filePath)
+			}
+
+			// Attach each pending "mtp-" file to its matching main model as
+			// a companion. An unmatched file (or one in a directory with no
+			// main model) is kept as a standalone model so user-downloaded
+			// files are never silently hidden.
+			for _, mtpPath := range pendingMTP {
+				if matchID, ok := matchMTPToModel(mtpPath, modelfiles); ok {
+					mtpFiles[matchID] = mtpPath
+					continue
+				}
+
+				modelID := extractModelID(filepath.Base(mtpPath))
+				modelfiles[modelID] = append(modelfiles[modelID], mtpPath)
+			}
+
+			ctx := context.Background()
+
+			for modelID, files := range modelfiles {
+				prev := currentIndex[modelID]
+				isValidated := prev.Validated
+
+				slices.Sort(files)
+
+				// Collect current file sizes and invalidate validation
+				// if any size changed (e.g. file was copied/replaced).
+				sizes := make([]int64, len(files))
+				for i, file := range files {
+					if info, err := os.Stat(file); err == nil {
+						sizes[i] = info.Size()
+					}
+				}
+
+				if isValidated && !fileSizesMatch(prev.FileSizes, sizes) {
+					isValidated = false
+				}
+
+				mp := Path{
+					ModelFiles: files,
+					Downloaded: true,
+					FileSizes:  sizes,
+				}
+
+				if projFile, exists := projFiles[modelID]; exists {
+					mp.ProjFile = projFile
+				}
+
+				if mtpFile, exists := mtpFiles[modelID]; exists {
+					mp.MTPFile = mtpFile
+				}
+
+				validated := isValidated
+				if checkSHA {
+					validated = true
+
+					for _, file := range files {
+						log(ctx, "running check ", "model", path.Base(file))
+						if err := model.CheckModel(file, true); err != nil {
+							log(ctx, "running check ", "model", path.Base(file), "ERROR", err)
+							validated = false
+						}
+					}
+
+					if mp.ProjFile != "" {
+						log(ctx, "running check ", "proj", path.Base(mp.ProjFile))
+						if err := model.CheckModel(mp.ProjFile, true); err != nil {
+							log(ctx, "running check ", "proj", path.Base(mp.ProjFile), "ERROR", err)
+							validated = false
+						}
+					}
+
+					if mp.MTPFile != "" {
+						log(ctx, "running check ", "mtp", path.Base(mp.MTPFile))
+						if err := model.CheckModel(mp.MTPFile, true); err != nil {
+							log(ctx, "running check ", "mtp", path.Base(mp.MTPFile), "ERROR", err)
+							validated = false
+						}
+					}
+				}
+
+				mp.Validated = validated
+				mp.TokenizerFingerprint = tokenizerFingerprintFromFile(files[0])
+
+				index[modelID] = mp
+			}
+		}
+	}
+
+	indexData, err := yaml.Marshal(&index)
+	if err != nil {
+		return fmt.Errorf("marshal index: %w", err)
+	}
+
+	indexPath := filepath.Join(m.modelsPath, indexFile)
+	if err := os.WriteFile(indexPath, indexData, 0644); err != nil {
+		return fmt.Errorf("write index file: %w", err)
+	}
+
+	return nil
+}
+
+// matchMTPToModel finds the main-model key in modelfiles that the MTP
+// drafter at mtpPath belongs to. It first looks for an exact model-id
+// match (the canonical companion name "mtp-<modelID>.gguf" re-keys to one
+// specific model), then falls back to a family match (model id minus quant
+// suffix) so an upstream-named companion like "mtp-gemma-4-26B-A4B-it.gguf"
+// still attaches when only one quant of the family is installed.
+func matchMTPToModel(mtpPath string, modelfiles map[string][]string) (string, bool) {
+	id := trimMTPPrefix(extractModelID(filepath.Base(mtpPath)))
+
+	for mid := range modelfiles {
+		if strings.EqualFold(mid, id) {
+			return mid, true
+		}
+	}
+
+	fam := stripQuantSuffix(id)
+
+	var best string
+	for mid := range modelfiles {
+		if strings.EqualFold(stripQuantSuffix(mid), fam) {
+			if best == "" || mid < best {
+				best = mid
+			}
+		}
+	}
+
+	return best, best != ""
+}
+
+// MarkValidated sets Validated=true for the specified model in the index,
+// without performing a full rebuild. The download flow already verifies SHAs
+// for each file via model.CheckModel, so the entry can be trusted as soon as
+// the index has been (re)built. Returns an error if the model is not present
+// in the index or the index cannot be written.
+func (m *Models) MarkValidated(modelID string) error {
+	m.biMutex.Lock()
+	defer m.biMutex.Unlock()
+
+	indexPath := filepath.Join(m.modelsPath, indexFile)
+
+	data, err := os.ReadFile(indexPath)
+	if err != nil {
+		return fmt.Errorf("mark-validated: read index: %w", err)
+	}
+
+	var index map[string]Path
+	if err := yaml.Unmarshal(data, &index); err != nil {
+		return fmt.Errorf("mark-validated: unmarshal index: %w", err)
+	}
+
+	mp, exists := index[modelID]
+	if !exists {
+		return fmt.Errorf("mark-validated: model %q not found in index", modelID)
+	}
+
+	if mp.Validated {
+		return nil
+	}
+
+	mp.Validated = true
+	index[modelID] = mp
+
+	out, err := yaml.Marshal(&index)
+	if err != nil {
+		return fmt.Errorf("mark-validated: marshal index: %w", err)
+	}
+
+	if err := os.WriteFile(indexPath, out, 0644); err != nil {
+		return fmt.Errorf("mark-validated: write index: %w", err)
+	}
+
+	return nil
+}
+
+// =============================================================================
+
+func (m *Models) removeEmptyDirs() error {
+	var dirs []string
+
+	err := filepath.WalkDir(m.modelsPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() && path != m.modelsPath {
+			dirs = append(dirs, path)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("walking directory tree: %w", err)
+	}
+
+	for i := len(dirs) - 1; i >= 0; i-- {
+		entries, err := os.ReadDir(dirs[i])
+		if err != nil {
+			continue
+		}
+
+		if isDirEffectivelyEmpty(entries) {
+			// Remove any .DS_Store before removing directory
+			dsStore := filepath.Join(dirs[i], ".DS_Store")
+			os.Remove(dsStore)
+			os.Remove(dirs[i])
+		}
+	}
+
+	return nil
+}
+
+// fileSizesMatch returns true if both slices have the same length and values.
+// An empty previous slice (legacy index) is treated as a mismatch to force
+// re-validation on first run after upgrade.
+func fileSizesMatch(prev, cur []int64) bool {
+	if len(prev) == 0 {
+		return false
+	}
+
+	if len(prev) != len(cur) {
+		return false
+	}
+
+	for i := range prev {
+		if prev[i] != cur[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isDirEffectivelyEmpty returns true if directory only contains ignorable files like .DS_Store
+func isDirEffectivelyEmpty(entries []os.DirEntry) bool {
+	for _, e := range entries {
+		if e.Name() != ".DS_Store" {
+			return false
+		}
+	}
+
+	return true
+}

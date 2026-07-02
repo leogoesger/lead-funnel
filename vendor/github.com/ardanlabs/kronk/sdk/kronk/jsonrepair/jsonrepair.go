@@ -1,0 +1,1232 @@
+// Package jsonrepair verifies and repairs malformed JSON produced by LLM
+// tool calls. The most common issue is unescaped double quotes inside string
+// values — e.g., when a model outputs source code containing import "fmt" or
+// markdown with "quoted" text. Standard json.Unmarshal fails on these, but the
+// key-value structure is otherwise intact.
+//
+// The package also handles Gemma4-style <|"|> quote tokens, bare (unquoted)
+// JSON keys, and backtick-comma separators.
+//
+// Usage:
+//
+//	repaired, err := jsonrepair.Repair(raw)
+package jsonrepair
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+)
+
+// ErrIrrecoverable is returned when the JSON cannot be repaired.
+var ErrIrrecoverable = errors.New("jsonrepair: irrecoverable JSON")
+
+// gemmaToken is the special quote delimiter used by Gemma4 models.
+const gemmaToken = "<|\"|>"
+
+// Repair verifies JSON and returns a valid version. If the input already
+// parses, it is returned unchanged. If the input is malformed but
+// repairable, the repaired JSON is returned. If the input cannot be
+// repaired, the original string and ErrIrrecoverable are returned.
+//
+// The repair pipeline:
+//  1. Quick-check: try json.Unmarshal; if valid, return immediately.
+//  2. Normalize Gemma4 <|"|> tokens to standard quotes (escaping inner ").
+//  3. Normalize backtick delimiters in structural positions to standard quotes.
+//  4. Quote bare JSON keys.
+//  5. Re-check: if valid after normalization, return.
+//  6. Key-aware repair: walk the JSON structure, find true closing quotes
+//     by scanning right-to-left for " followed by } / ] / ,"key": patterns.
+//  7. Verify the result with json.Unmarshal.
+//  8. If verification fails, try trimming a trailing extra } (Gemma double-brace).
+func Repair(s string) (string, error) {
+	if len(s) == 0 {
+		return s, ErrIrrecoverable
+	}
+
+	// Step 1: if it already parses, no repair needed.
+	if json.Valid([]byte(s)) {
+		return s, nil
+	}
+
+	// Step 2-4: normalize quoting.
+	normalized, changed := normalize(s)
+
+	// Step 5: check again after normalization (skip if nothing changed).
+	if changed && json.Valid([]byte(normalized)) {
+		return normalized, nil
+	}
+
+	// Step 6: key-aware repair of unescaped quotes in values.
+	repaired := repairQuotes(normalized)
+
+	// Step 7: verify. If the result has a trailing extra } from Gemma's
+	// double-brace wrapping (call:write{{...}}), try trimming it.
+	if json.Valid([]byte(repaired)) {
+		return repaired, nil
+	}
+
+	repaired = trimTrailingBrace(repaired)
+	if json.Valid([]byte(repaired)) {
+		return repaired, nil
+	}
+
+	return s, ErrIrrecoverable
+}
+
+// Unmarshal repairs the JSON string and unmarshals the result into v.
+// It combines Repair and json.Unmarshal into a single call.
+func Unmarshal(s string, v any) error {
+	repaired, err := Repair(s)
+	if err != nil {
+		return err
+	}
+
+	return json.Unmarshal([]byte(repaired), v)
+}
+
+// =============================================================================
+// Normalization
+// =============================================================================
+
+// normalize applies all pre-repair transformations: Gemma <|"|> replacement,
+// backtick delimiter normalization, and bare key quoting. The second return
+// value reports whether any transformation changed the string.
+func normalize(s string) (string, bool) {
+	orig := s
+	s = normalizeGemmaQuotes(s)
+	s = flattenNestedObject(s)
+	s = normalizeBacktickDelimiters(s)
+	s = quoteBareKeys(s)
+	s = fixMissingKeyCloseQuote(s)
+	s = normalizeBackslashControlChars(s)
+	return s, s != orig
+}
+
+// normalizeBackslashControlChars replaces a backslash followed by a raw
+// control character (TAB 0x09, LF 0x0A, CR 0x0D) with the corresponding
+// two-character JSON escape sequence (\t, \n, \r). Models sometimes emit
+// e.g. \<TAB> (backslash + literal tab byte) when they mean the two-char
+// sequence \t, producing invalid JSON that neither the standard parser nor
+// repairQuotes can recover from.
+func normalizeBackslashControlChars(s string) string {
+	// Quick scan: bail if no backslash + control char pattern exists.
+	found := false
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] == '\\' {
+			next := s[i+1]
+			if next == '\t' || next == '\n' || next == '\r' {
+				found = true
+				break
+			}
+			i++ // skip next char (already examined)
+		}
+	}
+	if !found {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case '\t':
+				b.WriteString(`\t`)
+				i++
+				continue
+			case '\n':
+				b.WriteString(`\n`)
+				i++
+				continue
+			case '\r':
+				b.WriteString(`\r`)
+				i++
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// normalizeGemmaQuotes converts <|"|> delimited values to standard JSON
+// quoted strings. The model uses <|"|> when the value contains literal "
+// characters (e.g., source code with import "fmt"). This function finds
+// each <|"|>...<|"|> pair, escapes any " inside the value to \", then
+// replaces the <|"|> delimiters with standard ".
+func normalizeGemmaQuotes(s string) string {
+	if !strings.Contains(s, gemmaToken) {
+		return s
+	}
+
+	tokenLen := len(gemmaToken)
+
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+
+	for i < len(s) {
+		openIdx := strings.Index(s[i:], gemmaToken)
+		if openIdx == -1 {
+			b.WriteString(s[i:])
+			break
+		}
+
+		// Write everything before the opening <|"|>.
+		// Fix missing key close-quote: the model sometimes writes
+		// "content:<|"|> instead of "content":<|"|> because the closing "
+		// gets swallowed by the adjacent <|"|> token boundary.
+		prefix := s[i : i+openIdx]
+		prefix = fixMissingKeyQuote(prefix)
+		b.WriteString(prefix)
+		i += openIdx + tokenLen
+
+		// Find the closing <|"|>. Use structural analysis: the correct
+		// closing token is followed by a JSON structural character
+		// (, } ] ") or end-of-string. Inner <|"|> tokens (used for
+		// Go string literals like fmt.Println(<|"|>hello<|"|>)) are
+		// followed by code characters like ) and must be skipped.
+		closeIdx := findStructuralGemmaClose(s[i:])
+		if closeIdx == -1 {
+			// No closing token — the model may have used a backtick as
+			// the alternate closer. Look for a structural backtick
+			// followed by a comma + key pattern.
+			rest := s[i:]
+			btIdx := findStructuralBacktick(rest)
+
+			if btIdx >= 0 {
+				// Treat the backtick as the closing delimiter. Escape
+				// the inner content the same way paired <|"|> does.
+				inner := rest[:btIdx]
+				hasRealNewlines := strings.Contains(inner, "\n")
+
+				b.WriteByte('"')
+				for j := 0; j < len(inner); j++ {
+					switch {
+					case inner[j] == '"':
+						b.WriteString(`\"`)
+					case inner[j] == '\\':
+						if j+1 < len(inner) {
+							next := inner[j+1]
+							j++
+							switch next {
+							case 'n', 'r', 't', 'b', 'f':
+								if hasRealNewlines {
+									b.WriteString(`\\`)
+									b.WriteByte(next)
+								} else {
+									b.WriteByte('\\')
+									b.WriteByte(next)
+								}
+							case '"', '\\', '/', 'u':
+								b.WriteByte('\\')
+								b.WriteByte(next)
+							default:
+								b.WriteString(`\\`)
+								b.WriteByte(next)
+							}
+						} else {
+							b.WriteByte('\\')
+						}
+					case inner[j] == '\n':
+						b.WriteString(`\n`)
+					case inner[j] == '\r':
+						b.WriteString(`\r`)
+					case inner[j] == '\t':
+						b.WriteString(`\t`)
+					default:
+						b.WriteByte(inner[j])
+					}
+				}
+				b.WriteByte('"')
+
+				// Advance past the backtick and apply tail fixups.
+				i += btIdx + 1
+				if i < len(s) {
+					tail := s[i:]
+					if stripped := stripSpuriousQuoteBeforeComma(tail); stripped != tail {
+						s = s[:i] + stripped
+						tail = s[i:]
+					}
+					if fixed := fixMissingKeyOpenQuote(tail); fixed != tail {
+						s = s[:i] + fixed
+					}
+				}
+				continue
+			}
+
+			// No structural backtick found either. Write " to close
+			// the value, then handle the remainder.
+			//
+			// The model sometimes wraps the remaining keys in an extra
+			// object: ,{"filePath":"path"}} instead of ,"filePath":"path"}.
+			// Unwrap the nested object so all keys end up at the top level.
+			b.WriteByte('"')
+			if unwrapped := unwrapNestedObject(rest); unwrapped != rest {
+				b.WriteString(unwrapped)
+			} else {
+				b.WriteString(rest)
+			}
+			break
+		}
+
+		// Extract the value between the <|"|> pair and convert to a valid
+		// JSON string: escape inner quotes and convert control characters
+		// to JSON escapes.
+		//
+		// The model may use either real newline bytes (0x0A) or literal
+		// \n escape sequences for line breaks. When real newlines are
+		// present, any literal \n sequences are source code escapes
+		// (e.g., fmt.Print("\n")) that must be double-escaped to survive
+		// JSON parsing. When no real newlines exist, the model used \n
+		// for all line breaks, so they must be treated as JSON \n escapes
+		// (becoming real newlines after unmarshal).
+		inner := s[i : i+closeIdx]
+		hasRealNewlines := strings.Contains(inner, "\n")
+
+		b.WriteByte('"')
+		for j := 0; j < len(inner); j++ {
+			switch {
+			case inner[j] == '"':
+				b.WriteString(`\"`)
+			case inner[j] == '\\':
+				if j+1 < len(inner) {
+					next := inner[j+1]
+					j++
+
+					switch next {
+					case 'n', 'r', 't', 'b', 'f':
+						if hasRealNewlines {
+							// Content has real newlines for line breaks,
+							// so these are source code escapes (e.g.,
+							// \n in fmt.Print("\n")). Double-escape so
+							// they survive JSON parsing as literal chars.
+							b.WriteString(`\\`)
+							b.WriteByte(next)
+						} else {
+							// No real newlines — model used \n for line
+							// breaks. Treat as JSON escape so they become
+							// real control characters after unmarshal.
+							b.WriteByte('\\')
+							b.WriteByte(next)
+						}
+					case '"', '\\', '/', 'u':
+						// Valid JSON escape — preserve as-is.
+						b.WriteByte('\\')
+						b.WriteByte(next)
+					default:
+						// Not a valid JSON escape (e.g., \0 from \033
+						// ANSI codes). Double-escape the backslash.
+						b.WriteString(`\\`)
+						b.WriteByte(next)
+					}
+				} else {
+					b.WriteByte('\\')
+				}
+			case inner[j] == '\n':
+				b.WriteString(`\n`)
+			case inner[j] == '\r':
+				b.WriteString(`\r`)
+			case inner[j] == '\t':
+				b.WriteString(`\t`)
+			default:
+				b.WriteByte(inner[j])
+			}
+		}
+		b.WriteByte('"')
+		i += closeIdx + tokenLen
+
+		// After the closing <|"|>, the model may write the next key with
+		// a missing opening quote: ,filePath":  instead of ,"filePath":.
+		// The <|"|> token boundary swallows the opening " of the key.
+		// Splice the fix into s so the remainder is parsed correctly.
+		//
+		// The model may also emit a spurious " between the closing <|"|>
+		// and the comma separator: <|"|>",filePath: instead of
+		// <|"|>,filePath:. Strip the leading " so the tail starts with
+		// the comma for fixMissingKeyOpenQuote.
+		if i < len(s) {
+			tail := s[i:]
+			if stripped := stripSpuriousQuoteBeforeComma(tail); stripped != tail {
+				s = s[:i] + stripped
+				tail = s[i:]
+			}
+			if fixed := fixMissingKeyOpenQuote(tail); fixed != tail {
+				s = s[:i] + fixed
+			}
+		}
+	}
+
+	return b.String()
+}
+
+// findStructuralGemmaClose finds the closing <|"|> token that ends a JSON
+// value. When the model uses <|"|> for ALL quote characters (both JSON
+// delimiters and inner Go string literals), the correct closing token is
+// the one followed by a JSON structural character (, } ] ") or end-of-string.
+// Inner <|"|> tokens (e.g., fmt.Println(<|"|>hello<|"|>)) are followed by
+// code characters like ) and must be skipped.
+//
+// Returns the index of the opening < of the closing <|"|> in s, or -1.
+func findStructuralGemmaClose(s string) int {
+	tokenLen := len(gemmaToken)
+	searchFrom := 0
+
+	for {
+		idx := strings.Index(s[searchFrom:], gemmaToken)
+		if idx == -1 {
+			return -1
+		}
+
+		pos := searchFrom + idx
+		afterToken := pos + tokenLen
+
+		// <|"|> at the end of the string is structural.
+		if afterToken >= len(s) {
+			return pos
+		}
+
+		// Check the character after the token. Structural closers are
+		// followed by JSON punctuation or whitespace-then-punctuation.
+		j := afterToken
+		for j < len(s) && isWhitespace(s[j]) {
+			j++
+		}
+
+		if j >= len(s) {
+			return pos
+		}
+
+		switch s[j] {
+		case ',', '}', ']', '"':
+			return pos
+		}
+
+		// Not structural — skip past this token and continue searching.
+		searchFrom = afterToken
+	}
+}
+
+// fixMissingKeyOpenQuote fixes the pattern ,key": that appears after a
+// closing <|"|>. The model sometimes writes ,filePath": instead of
+// ,"filePath": because the opening " of the key name gets swallowed by
+// the adjacent <|"|> token boundary. This function inserts the missing "
+// before the key identifier.
+func fixMissingKeyOpenQuote(suffix string) string {
+	// Must start with comma (optionally whitespace) then identifier then ":
+	j := 0
+	if j >= len(suffix) || suffix[j] != ',' {
+		return suffix
+	}
+	j++
+
+	// Skip whitespace after comma.
+	for j < len(suffix) && isWhitespace(suffix[j]) {
+		j++
+	}
+
+	// Must NOT start with " (already quoted).
+	if j >= len(suffix) || suffix[j] == '"' {
+		return suffix
+	}
+
+	// Scan identifier.
+	keyStart := j
+	for j < len(suffix) && isIdentChar(suffix[j]) {
+		j++
+	}
+	keyLen := j - keyStart
+	if keyLen == 0 || keyLen > 40 {
+		return suffix
+	}
+
+	// Must be followed by ":
+	if j+1 < len(suffix) && suffix[j] == '"' && suffix[j+1] == ':' {
+		// Pattern matched: ,identifier": → ,"identifier":
+		return suffix[:keyStart] + `"` + suffix[keyStart:]
+	}
+
+	return suffix
+}
+
+// stripSpuriousQuoteBeforeComma removes a leading " when it appears before
+// a comma-separated key. The model sometimes writes <|"|>",filePath: instead
+// of <|"|>,filePath: — the " is a spurious artifact from the token boundary.
+// This strips it so the tail starts with , for normal key processing.
+func stripSpuriousQuoteBeforeComma(suffix string) string {
+	if len(suffix) < 2 || suffix[0] != '"' {
+		return suffix
+	}
+
+	// Skip optional whitespace after ".
+	j := 1
+	for j < len(suffix) && isWhitespace(suffix[j]) {
+		j++
+	}
+
+	if j >= len(suffix) || suffix[j] != ',' {
+		return suffix
+	}
+
+	// Check that what follows the comma looks like a key. This prevents
+	// stripping a " that is actually part of a JSON value.
+	k := j + 1
+	for k < len(suffix) && isWhitespace(suffix[k]) {
+		k++
+	}
+
+	// Already-quoted key: ,"key":
+	if k < len(suffix) && suffix[k] == '"' {
+		k++
+		qkStart := k
+		for k < len(suffix) && isIdentChar(suffix[k]) {
+			k++
+		}
+		qkLen := k - qkStart
+		if qkLen > 0 && qkLen <= 40 && k+1 < len(suffix) && suffix[k] == '"' && suffix[k+1] == ':' {
+			return suffix[1:]
+		}
+		return suffix
+	}
+
+	// Bare key: identifier followed by : or ": or <|"|>.
+	keyStart := k
+	for k < len(suffix) && isIdentChar(suffix[k]) {
+		k++
+	}
+	keyLen := k - keyStart
+	if keyLen == 0 || keyLen > 40 {
+		return suffix
+	}
+
+	rest := suffix[k:]
+	if len(rest) > 0 && rest[0] == ':' {
+		return suffix[1:]
+	}
+	if len(rest) > 1 && rest[0] == '"' && rest[1] == ':' {
+		return suffix[1:]
+	}
+	if strings.HasPrefix(rest, gemmaToken) {
+		return suffix[1:]
+	}
+
+	return suffix
+}
+
+// fixMissingKeyQuote fixes the pattern "key: that appears before <|"|>.
+// The model sometimes writes "content:<|"|> instead of "content":<|"|>
+// because the closing " of the key name gets swallowed by the adjacent
+// <|"|> token boundary. This function inserts the missing " before :.
+func fixMissingKeyQuote(prefix string) string {
+	n := len(prefix)
+	if n < 3 || prefix[n-1] != ':' {
+		return prefix
+	}
+
+	// Scan backwards past the identifier before :.
+	k := n - 2
+	for k >= 0 && isIdentChar(prefix[k]) {
+		k--
+	}
+
+	keyLen := (n - 2) - k
+	if keyLen == 0 || k < 0 || prefix[k] != '"' {
+		return prefix
+	}
+
+	// Pattern matched: "identifier: → "identifier":
+	return prefix[:n-1] + `":`
+}
+
+// fixMissingKeyCloseQuote scans the entire string for JSON keys that have an
+// opening " but no closing " before the colon. The model sometimes writes
+// ,"oldString:"value" instead of ,"oldString":"value" — the closing " on the
+// key is missing. This function inserts the missing " before each such colon.
+//
+// The scan walks the string tracking string state. When outside a string and
+// a " is followed by an identifier then a : (without a closing " between the
+// identifier and the colon), it inserts the missing quote.
+func fixMissingKeyCloseQuote(s string) string {
+	var buf strings.Builder
+	changed := false
+
+	i := 0
+	for i < len(s) {
+		// Look for a structural position where a key could start:
+		// after { or , (optionally with whitespace).
+		if s[i] != '{' && s[i] != ',' {
+			if changed {
+				buf.WriteByte(s[i])
+			}
+			i++
+			continue
+		}
+
+		// Write the { or , character.
+		if changed {
+			buf.WriteByte(s[i])
+		}
+		i++
+
+		// Skip whitespace.
+		for i < len(s) && isWhitespace(s[i]) {
+			if changed {
+				buf.WriteByte(s[i])
+			}
+			i++
+		}
+
+		// Must start with " (this is the opening quote of the key).
+		if i >= len(s) || s[i] != '"' {
+			continue
+		}
+
+		// Check if this is "identifier: (missing close quote).
+		// Scan past the " and identifier chars.
+		j := i + 1
+		for j < len(s) && isIdentChar(s[j]) {
+			j++
+		}
+
+		keyLen := j - (i + 1)
+		if keyLen == 0 || keyLen > 40 || j >= len(s) {
+			// No identifier or too long — not our pattern.
+			if changed {
+				buf.WriteByte(s[i])
+			}
+			i++
+			continue
+		}
+
+		// If followed by ": — the key is already properly closed.
+		if s[j] == '"' {
+			if changed {
+				buf.WriteByte(s[i])
+			}
+			i++
+			continue
+		}
+
+		// If followed by : directly (no closing ") — this is the bug.
+		if s[j] == ':' {
+			if !changed {
+				buf.Grow(len(s) + 16)
+				buf.WriteString(s[:j])
+				changed = true
+			} else {
+				buf.WriteString(s[i:j])
+			}
+			buf.WriteByte('"')
+			// Don't advance i past j — the : will be written in the next iteration.
+			i = j
+			continue
+		}
+
+		// Some other character after identifier — not our pattern.
+		if changed {
+			buf.WriteByte(s[i])
+		}
+		i++
+	}
+
+	if !changed {
+		return s
+	}
+	return buf.String()
+}
+
+// findStructuralBacktick finds the last backtick in s that appears in a
+// structural position — i.e., followed (after optional whitespace) by a
+// comma + key pattern, or by } / ] / end-of-string. This identifies a
+// backtick that the model used as the closing delimiter for a value that
+// was opened with <|"|>. We scan right-to-left and accept the first match
+// so the longest (most inclusive) value wins, matching findKeyAwareClosingQuote
+// semantics.
+//
+// The key pattern includes the malformed variant filePath": (missing opening
+// quote on the key) since fixMissingKeyOpenQuote handles that downstream.
+func findStructuralBacktick(s string) int {
+	for k := len(s) - 1; k >= 0; k-- {
+		if s[k] != '`' {
+			continue
+		}
+
+		// Check what follows the backtick.
+		j := k + 1
+		for j < len(s) && isWhitespace(s[j]) {
+			j++
+		}
+
+		if j >= len(s) {
+			return k
+		}
+
+		switch s[j] {
+		case '}', ']':
+			after := j + 1
+			for after < len(s) && (isWhitespace(s[after]) || s[after] == '}') {
+				after++
+			}
+			if after >= len(s) {
+				return k
+			}
+
+		case ',':
+			// Standard key patterns: ,"key": or ,key:
+			if isFollowedByKey(s, j+1) {
+				return k
+			}
+
+			// Malformed key pattern from Gemma token boundary: ,key":
+			// where the opening " of the key is missing.
+			if isFollowedByMalformedKey(s, j+1) {
+				return k
+			}
+		}
+	}
+
+	return -1
+}
+
+// isFollowedByMalformedKey checks whether position j in s starts with the
+// pattern identifier": (an unquoted key followed by a quote-colon). This
+// is the malformed variant that fixMissingKeyOpenQuote repairs.
+func isFollowedByMalformedKey(s string, j int) bool {
+	for j < len(s) && isWhitespace(s[j]) {
+		j++
+	}
+
+	if j >= len(s) || !isIdentChar(s[j]) {
+		return false
+	}
+
+	keyStart := j
+	for j < len(s) && isIdentChar(s[j]) {
+		j++
+	}
+	keyLen := j - keyStart
+	if keyLen == 0 || keyLen > 40 {
+		return false
+	}
+
+	// Must be followed by ":
+	return j+1 < len(s) && s[j] == '"' && s[j+1] == ':'
+}
+
+// normalizeBacktickDelimiters replaces backticks that appear in JSON structural
+// positions with standard double quotes. Models sometimes use backticks as
+// string delimiters — e.g., opening with <|"|> but closing with `, or using
+// backtick pairs around values. A backtick is considered structural when:
+//   - It's followed (skipping whitespace) by , + key pattern, or } ] or end-of-string.
+//   - It's preceded (skipping whitespace) by : (value opener).
+func normalizeBacktickDelimiters(s string) string {
+	if !strings.Contains(s, "`") {
+		return s
+	}
+
+	var buf strings.Builder
+	buf.Grow(len(s))
+
+	for i := 0; i < len(s); i++ {
+		if s[i] != '`' {
+			buf.WriteByte(s[i])
+			continue
+		}
+
+		structural := false
+
+		// Look ahead: backtick closing a value.
+		j := i + 1
+		for j < len(s) && isWhitespace(s[j]) {
+			j++
+		}
+
+		if j >= len(s) || s[j] == '}' || s[j] == ']' {
+			structural = true
+		} else if s[j] == ',' {
+			// Comma followed by a key pattern: this backtick closes a value.
+			if isFollowedByKey(s, j+1) {
+				structural = true
+			}
+
+			// Comma followed by another backtick: paired delimiter pattern
+			// (e.g., "hello`,`filePath" where backticks replace quotes).
+			if !structural {
+				k := j + 1
+				for k < len(s) && isWhitespace(s[k]) {
+					k++
+				}
+				if k < len(s) && s[k] == '`' {
+					structural = true
+				}
+			}
+		}
+
+		// Look behind: backtick opening a value after colon, or opening a
+		// key after comma / { / [.
+		if !structural {
+			k := i - 1
+			for k >= 0 && isWhitespace(s[k]) {
+				k--
+			}
+			if k >= 0 && (s[k] == ':' || s[k] == ',' || s[k] == '{' || s[k] == '[') {
+				structural = true
+			}
+		}
+
+		if structural {
+			buf.WriteByte('"')
+		} else {
+			buf.WriteByte('`')
+		}
+	}
+
+	return buf.String()
+}
+
+// quoteBareKeys adds double quotes around unquoted JSON keys.
+// Models often emit keys without quotes: {content:"text",priority:"high"}
+// which is not valid JSON. This function converts them to proper JSON:
+// {"content":"text","priority":"high"}.
+func quoteBareKeys(s string) string {
+	var buf strings.Builder
+	changed := false
+
+	inString := false
+	escaped := false
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+
+		if escaped {
+			if changed {
+				buf.WriteByte(c)
+			}
+			escaped = false
+			continue
+		}
+
+		if c == '\\' && inString {
+			if changed {
+				buf.WriteByte(c)
+			}
+			escaped = true
+			continue
+		}
+
+		if c == '"' {
+			inString = !inString
+			if changed {
+				buf.WriteByte(c)
+			}
+			continue
+		}
+
+		if inString {
+			if changed {
+				buf.WriteByte(c)
+			}
+			continue
+		}
+
+		// Outside a string: check if this is the start of a bare key.
+		// A bare key follows { , [ or is at the start, and is a word
+		// followed by a colon.
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_' {
+			// Look ahead to find the colon.
+			j := i + 1
+			for j < len(s) && (s[j] >= 'a' && s[j] <= 'z' || s[j] >= 'A' && s[j] <= 'Z' || s[j] >= '0' && s[j] <= '9' || s[j] == '_') {
+				j++
+			}
+
+			if j < len(s) && s[j] == ':' {
+				// This is a bare key — start the builder on first mutation.
+				if !changed {
+					buf.Grow(len(s) + 32)
+					buf.WriteString(s[:i])
+					changed = true
+				}
+				buf.WriteByte('"')
+				buf.WriteString(s[i:j])
+				buf.WriteByte('"')
+				i = j - 1
+				continue
+			}
+		}
+
+		if changed {
+			buf.WriteByte(c)
+		}
+	}
+
+	if !changed {
+		return s
+	}
+
+	return buf.String()
+}
+
+// =============================================================================
+// Key-aware quote repair
+// =============================================================================
+
+// repairQuotes walks the JSON with key-value structure awareness. After a
+// colon introduces a string value, the real closing " is found by
+// findKeyAwareClosingQuote. All other " between open and close are escaped.
+func repairQuotes(s string) string {
+	var buf strings.Builder
+	buf.Grow(len(s) + 64)
+
+	i := 0
+	for i < len(s) {
+		c := s[i]
+
+		switch c {
+		case '{', '}', '[', ']', ',':
+			buf.WriteByte(c)
+			i++
+
+		case ':':
+			buf.WriteByte(c)
+			i++
+
+			// Skip whitespace after colon.
+			for i < len(s) && isWhitespace(s[i]) {
+				buf.WriteByte(s[i])
+				i++
+			}
+
+			if i >= len(s) {
+				break
+			}
+
+			// Value starts here. If it's a string, repair inner quotes.
+			if s[i] == '"' {
+				i++ // skip opening quote
+
+				// Find the closing quote using key-aware analysis.
+				closePos := findKeyAwareClosingQuote(s, i)
+
+				if closePos == -1 {
+					// No valid closing quote found. Write what we have.
+					buf.WriteByte('"')
+					buf.WriteString(s[i:])
+					i = len(s)
+					break
+				}
+
+				// Write the opening quote, escape all inner " chars,
+				// then write the closing quote.
+				inner := s[i:closePos]
+
+				// Determine whether the model did any JSON escaping at
+				// all. If the inner content has unescaped " characters,
+				// the model output raw source code — so \n, \t, etc.
+				// are source-code literals that need double-escaping.
+				// If there are no unescaped quotes, the model did
+				// proper JSON escaping (only raw control chars like
+				// TAB slipped through), so \n, \t are valid JSON
+				// escapes that must be preserved as-is.
+				hasUnescapedQuotes := containsUnescapedQuote(inner)
+
+				buf.WriteByte('"')
+				for j := 0; j < len(inner); j++ {
+					switch {
+					case inner[j] == '\\' && j+1 < len(inner):
+						next := inner[j+1]
+						j++
+
+						switch next {
+						case '"', '\\', '/', 'u':
+							// Valid JSON escape — always preserve.
+							buf.WriteByte('\\')
+							buf.WriteByte(next)
+						case 'n', 'r', 't', 'b', 'f':
+							if hasUnescapedQuotes {
+								// Model didn't JSON-escape at all —
+								// these are source-code literals.
+								buf.WriteString(`\\`)
+								buf.WriteByte(next)
+							} else {
+								// Model used proper JSON escaping —
+								// these are valid JSON escapes.
+								buf.WriteByte('\\')
+								buf.WriteByte(next)
+							}
+						default:
+							// Invalid JSON escape (e.g., \0 from \033 ANSI
+							// codes). Double-escape so the literal backslash
+							// survives JSON parsing.
+							buf.WriteString(`\\`)
+							buf.WriteByte(next)
+						}
+					case inner[j] == '"':
+						buf.WriteString(`\"`)
+					case inner[j] == '\n':
+						buf.WriteString(`\n`)
+					case inner[j] == '\r':
+						buf.WriteString(`\r`)
+					case inner[j] == '\t':
+						buf.WriteString(`\t`)
+					default:
+						buf.WriteByte(inner[j])
+					}
+				}
+				buf.WriteByte('"')
+				i = closePos + 1
+			}
+
+			// Non-string values (numbers, booleans, null, objects, arrays)
+			// are written as-is by the outer loop.
+
+		default:
+			buf.WriteByte(c)
+			i++
+		}
+	}
+
+	return buf.String()
+}
+
+// findKeyAwareClosingQuote finds the real closing quote of a JSON string value
+// starting at position start in s (start is the index right after the opening
+// quote). It scans right-to-left for a " followed by either end-of-object
+// (} / ]), or the start of a new key-value pair (,"key": or ,key:). Keys are
+// always short identifiers — never code fragments — so this distinguishes
+// structural quotes from content quotes even when content contains patterns
+// like "1", "2" that fool simpler heuristics.
+//
+// Returns the index of the closing quote in s, or -1 if not found.
+func findKeyAwareClosingQuote(s string, start int) int {
+	// Scan right-to-left so the longest (most inclusive) value wins.
+	best := -1
+
+	for k := len(s) - 1; k >= start; k-- {
+		if s[k] != '"' {
+			continue
+		}
+
+		// Skip escaped quotes.
+		if k > 0 && s[k-1] == '\\' {
+			continue
+		}
+
+		// Check what follows this quote.
+		j := k + 1
+
+		// Skip whitespace.
+		for j < len(s) && isWhitespace(s[j]) {
+			j++
+		}
+
+		if j >= len(s) {
+			// Quote at end of string — structural.
+			if best == -1 || k < best {
+				best = k
+			}
+			continue
+		}
+
+		switch s[j] {
+		case '}', ']':
+			// Only treat as structural if this is the outermost closing
+			// brace/bracket — i.e., nothing but whitespace and possibly
+			// extra } from Gemma's double-brace wrapping follows it.
+			// Content like [9]string{"3"} has } inside the value, but
+			// more content follows, so it's not the JSON object end.
+			after := j + 1
+			for after < len(s) && (isWhitespace(s[after]) || s[after] == '}') {
+				after++
+			}
+			if after >= len(s) {
+				if best == -1 || k < best {
+					best = k
+				}
+			}
+			continue
+
+		case ',':
+			// Comma — check if followed by a key (short identifier + colon).
+			if isFollowedByKey(s, j+1) {
+				if best == -1 || k < best {
+					best = k
+				}
+			}
+			continue
+		}
+	}
+
+	return best
+}
+
+// isFollowedByKey checks whether position j in s starts with an identifier
+// key pattern: optional whitespace, then either "identifier": or identifier:
+// where identifier is a short (≤40 char) word made of [a-zA-Z0-9_].
+func isFollowedByKey(s string, j int) bool {
+	// Skip whitespace.
+	for j < len(s) && isWhitespace(s[j]) {
+		j++
+	}
+
+	if j >= len(s) {
+		return false
+	}
+
+	// Quoted key: "identifier":
+	if s[j] == '"' {
+		j++
+		keyStart := j
+		for j < len(s) && isIdentChar(s[j]) {
+			j++
+		}
+		keyLen := j - keyStart
+		if keyLen == 0 || keyLen > 40 {
+			return false
+		}
+		if j < len(s) && s[j] == '"' {
+			j++
+			// Skip whitespace after closing quote.
+			for j < len(s) && isWhitespace(s[j]) {
+				j++
+			}
+			return j < len(s) && s[j] == ':'
+		}
+		return false
+	}
+
+	// Bare key: identifier:
+	keyStart := j
+	for j < len(s) && isIdentChar(s[j]) {
+		j++
+	}
+	keyLen := j - keyStart
+	if keyLen == 0 || keyLen > 40 {
+		return false
+	}
+
+	// Skip whitespace before colon.
+	for j < len(s) && isWhitespace(s[j]) {
+		j++
+	}
+
+	return j < len(s) && s[j] == ':'
+}
+
+// =============================================================================
+// Structural fixups
+// =============================================================================
+
+// flattenNestedObject handles the pattern where the model wraps one or more
+// trailing key-value pairs in a spurious nested object. After Gemma <|"|>
+// normalization the JSON looks like:
+//
+//	{"command":"ls -a",{"description":"list files"}}
+//
+// This is invalid because the value after the comma is a bare object, not a
+// key-value pair. The function detects ",{" at the top level (outside strings)
+// and removes the inner { plus one trailing } to produce valid flat JSON:
+//
+//	{"command":"ls -a","description":"list files"}
+func flattenNestedObject(s string) string {
+	// Quick check: must contain ,{ and end with }}.
+	if !strings.Contains(s, ",{") {
+		return s
+	}
+	trimmed := strings.TrimRight(s, " \t\n\r")
+	if len(trimmed) < 2 || trimmed[len(trimmed)-1] != '}' || trimmed[len(trimmed)-2] != '}' {
+		return s
+	}
+
+	// Walk the string to find a top-level ",{" that is not inside a string.
+	inString := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && inString {
+			i++ // skip escaped char
+			continue
+		}
+		if s[i] == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if s[i] == ',' && i+1 < len(s) && s[i+1] == '{' {
+			// Found structural ,{ — remove the { and one trailing }.
+			return s[:i+1] + s[i+2:len(trimmed)-1]
+		}
+	}
+
+	return s
+}
+
+// unwrapNestedObject handles the pattern ,{"key":"value"}} that appears after
+// an unpaired <|"|> token. The model wraps the remaining keys in an extra
+// object instead of listing them as flat siblings. This converts:
+//
+//	,{"filePath":"path"}}  →  ,"filePath":"path"}
+//
+// Returns the original string unchanged if the pattern is not detected.
+func unwrapNestedObject(s string) string {
+	// Must start with ,{ (optional whitespace).
+	j := 0
+	for j < len(s) && isWhitespace(s[j]) {
+		j++
+	}
+	if j >= len(s) || s[j] != ',' {
+		return s
+	}
+	j++
+	for j < len(s) && isWhitespace(s[j]) {
+		j++
+	}
+	if j >= len(s) || s[j] != '{' {
+		return s
+	}
+
+	// Must end with }} (optional whitespace).
+	trimmed := strings.TrimRight(s, " \t\n\r")
+	if len(trimmed) < 2 || trimmed[len(trimmed)-1] != '}' || trimmed[len(trimmed)-2] != '}' {
+		return s
+	}
+
+	// Remove the nested { and one trailing }.
+	return s[:j] + s[j+1:len(trimmed)-1]
+}
+
+// trimTrailingBrace removes one trailing } when the JSON has unbalanced braces.
+// This fixes Gemma's double-brace wrapping: call:write{{...}} leaks the outer
+// closing } into the extracted JSON, producing {"key":"val"}}.
+func trimTrailingBrace(s string) string {
+	trimmed := strings.TrimRight(s, " \t\n\r")
+	if len(trimmed) < 2 || trimmed[len(trimmed)-1] != '}' || trimmed[len(trimmed)-2] != '}' {
+		return s
+	}
+
+	return trimmed[:len(trimmed)-1]
+}
+
+// =============================================================================
+// Character classification helpers
+// =============================================================================
+
+func isWhitespace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+func isIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+}
+
+// containsUnescapedQuote returns true if s contains at least one " that is not
+// preceded by a backslash. This indicates the model produced raw source code
+// without JSON escaping its string values.
+func containsUnescapedQuote(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' && (i == 0 || s[i-1] != '\\') {
+			return true
+		}
+	}
+	return false
+}

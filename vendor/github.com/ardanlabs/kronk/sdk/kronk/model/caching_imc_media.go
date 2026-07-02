@@ -1,0 +1,424 @@
+package model
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"strings"
+	"unsafe"
+
+	"github.com/ardanlabs/kronk/sdk/kronk/observ/otel"
+	"github.com/hybridgroup/yzma/pkg/llama"
+	"github.com/hybridgroup/yzma/pkg/mtmd"
+	"go.opentelemetry.io/otel/attribute"
+)
+
+// decodeMediaIntoCache decodes a document containing text and media (images/audio)
+// into a KV cache sequence using the mtmd pipeline. This is used by IMC media
+// cache builds to populate the slot's KV cache with the full multi-modal prefix.
+//
+// When skipTextTokens > 0, the first skipTextTokens text tokens are assumed to
+// already be decoded in the KV cache and are skipped. This enables partial media
+// extends where a text-only cache prefix is preserved and only the new content
+// (remaining text + media + post-media text) is decoded.
+//
+// The passed-in mtmdCtx is reused from job.mtmdCtx to avoid loading the
+// projection file twice. Returns the total number of KV positions cached and
+// the KV positions consumed per media chunk.
+func (m *Model) decodeMediaIntoCache(ctx context.Context, cacheD D, seqID llama.SeqId, mtmdCtx mtmd.Context, skipTextTokens int) (int, []int, error) {
+	ctx, span := otel.AddSpan(ctx, "imc-media-cache-build",
+		attribute.Int("seq", int(seqID)),
+	)
+	defer span.End()
+
+	// Step 1: Create prompt and extract media bytes from the cache document.
+	prompt, media, err := m.createPrompt(ctx, cacheD)
+	if err != nil {
+		return 0, nil, fmt.Errorf("imc-media-cache: unable to create prompt: %w", err)
+	}
+
+	m.log(ctx, "imc-media-cache", "status", "prompt-created", "seq", seqID,
+		"prompt_len", len(prompt), "media_count", len(media))
+
+	// Step 2: Create bitmaps from raw media bytes. Images are decoded in Go
+	// (newMediaBitmap) and built via the stable mtmd_bitmap_init core API;
+	// audio still goes through the mtmd-helper. Reject any payload that fails
+	// to decode so we surface a precise error instead of the generic
+	// "tokenization failed with code 1" from mtmd.Tokenize.
+	bitmaps := make([]mtmd.Bitmap, len(media))
+	defer func() {
+		for _, b := range bitmaps {
+			if b != 0 {
+				mtmd.BitmapFree(b)
+			}
+		}
+	}()
+	for i, med := range media {
+		if len(med) == 0 {
+			return 0, nil, fmt.Errorf("imc-media-cache: media[%d] is empty", i)
+		}
+		bmp, err := newMediaBitmap(mtmdCtx, med)
+		if err != nil {
+			return 0, nil, fmt.Errorf("imc-media-cache: media[%d]: %w", i, err)
+		}
+		bitmaps[i] = bmp
+	}
+
+	// Step 3: Tokenize the prompt with media into interleaved chunks.
+	// Verify the marker count in the rendered prompt matches the number of
+	// bitmaps before calling mtmd.Tokenize. mtmd returns an opaque code 1
+	// when these don't match; pre-checking here gives a precise error and
+	// catches double-render or template bugs early.
+	markerCount := strings.Count(prompt, mtmd.DefaultMarker())
+	if markerCount != len(bitmaps) {
+		return 0, nil, fmt.Errorf("imc-media-cache: marker/bitmap count mismatch: prompt has %d %q markers but %d bitmaps were prepared", markerCount, mtmd.DefaultMarker(), len(bitmaps))
+	}
+
+	inputChunks := mtmd.InputChunksInit()
+	defer mtmd.InputChunksFree(inputChunks)
+
+	input := mtmd.NewInputText(prompt, true, true)
+	if result := mtmd.Tokenize(mtmdCtx, inputChunks, input, bitmaps); result != 0 {
+		return 0, nil, fmt.Errorf("imc-media-cache: tokenization failed with code %d", result)
+	}
+
+	useMRoPE := mtmd.DecodeUseMRope(mtmdCtx)
+	useNonCausal := mtmd.DecodeUseNonCausal(mtmdCtx, 0)
+
+	numChunks := mtmd.InputChunksSize(inputChunks)
+
+	m.log(ctx, "imc-media-cache", "status", "tokenized", "seq", seqID,
+		"num_chunks", numChunks, "use_mrope", useMRoPE, "use_noncausal", useNonCausal)
+
+	// Step 4: Process each chunk, decoding into the KV cache sequence.
+	var pos int
+	var mediaKVCounts []int
+	remaining := skipTextTokens
+
+	for i := range numChunks {
+		chunk := mtmd.InputChunksGet(inputChunks, i)
+		chunkType := mtmd.InputChunkGetType(chunk)
+		nTokens := mtmd.InputChunkGetNTokens(chunk)
+
+		switch chunkType {
+		case mtmd.InputChunkTypeText:
+			tokens := mtmd.InputChunkGetTokensText(chunk)
+			if len(tokens) == 0 {
+				continue
+			}
+
+			// Skip text tokens that are already decoded in the KV cache.
+			if remaining > 0 {
+				if remaining >= len(tokens) {
+					m.log(ctx, "imc-media-cache", "status", "skipping-cached-text-chunk", "seq", seqID,
+						"chunk", i, "tokens", len(tokens), "remaining_skip", remaining-len(tokens))
+					pos += len(tokens)
+					remaining -= len(tokens)
+					continue
+				}
+
+				m.log(ctx, "imc-media-cache", "status", "partial-skip-text-chunk", "seq", seqID,
+					"chunk", i, "skip", remaining, "total", len(tokens))
+				pos += remaining
+				tokens = tokens[remaining:]
+				remaining = 0
+			}
+
+			m.log(ctx, "imc-media-cache", "status", "decoding-text-chunk", "seq", seqID,
+				"chunk", i, "tokens", len(tokens), "pos", pos, "mrope", useMRoPE)
+
+			switch {
+			case useMRoPE:
+				nDecoded, err := m.decodeTextMRoPEIntoCache(tokens, seqID, pos)
+				if err != nil {
+					return 0, nil, fmt.Errorf("imc-media-cache: text chunk %d (M-RoPE): %w", i, err)
+				}
+				pos += nDecoded
+			default:
+				if err := m.decodeTokensIntoCache(ctx, tokens, seqID, pos); err != nil {
+					return 0, nil, fmt.Errorf("imc-media-cache: text chunk %d: %w", i, err)
+				}
+				pos += len(tokens)
+			}
+
+		case mtmd.InputChunkTypeImage:
+			m.log(ctx, "imc-media-cache", "status", "encoding-image-chunk", "seq", seqID,
+				"chunk", i, "tokens", nTokens, "pos", pos)
+
+			if err := mtmd.EncodeChunk(mtmdCtx, chunk); err != nil {
+				return 0, nil, fmt.Errorf("imc-media-cache: encode image chunk %d: %w", i, err)
+			}
+
+			nEmbd := llama.ModelNEmbdInp(m.model)
+			embedSize := nEmbd * int32(nTokens)
+			embd, err := mtmd.GetOutputEmbd(mtmdCtx, embedSize)
+			if err != nil {
+				return 0, nil, fmt.Errorf("imc-media-cache: get image embeddings chunk %d: %w", i, err)
+			}
+
+			switch {
+			case useMRoPE:
+				imageTokens := mtmd.InputChunkGetTokensImage(chunk)
+				nx := int32(mtmd.ImageTokensGetNX(imageTokens))
+				ny := int32(mtmd.ImageTokensGetNY(imageTokens))
+
+				m.log(ctx, "imc-media-cache", "status", "decoding-image-mrope", "seq", seqID,
+					"chunk", i, "nx", nx, "ny", ny, "pos", pos)
+
+				nDecoded, err := m.decodeEmbeddingsMRoPEIntoCache(embd, nEmbd, int32(nTokens), nx, ny, seqID, pos, useNonCausal)
+				if err != nil {
+					return 0, nil, fmt.Errorf("imc-media-cache: decode image embeddings chunk %d (M-RoPE): %w", i, err)
+				}
+				pos += nDecoded
+				mediaKVCounts = append(mediaKVCounts, nDecoded)
+			default:
+				nDecoded, err := m.decodeEmbeddingsIntoCache(embd, nEmbd, int32(nTokens), seqID, pos, useNonCausal)
+				if err != nil {
+					return 0, nil, fmt.Errorf("imc-media-cache: decode image embeddings chunk %d: %w", i, err)
+				}
+				pos += nDecoded
+				mediaKVCounts = append(mediaKVCounts, nDecoded)
+			}
+
+		case mtmd.InputChunkTypeAudio:
+			m.log(ctx, "imc-media-cache", "status", "encoding-audio-chunk", "seq", seqID,
+				"chunk", i, "tokens", nTokens, "pos", pos)
+
+			if err := mtmd.EncodeChunk(mtmdCtx, chunk); err != nil {
+				return 0, nil, fmt.Errorf("imc-media-cache: encode audio chunk %d: %w", i, err)
+			}
+
+			nEmbd := llama.ModelNEmbdInp(m.model)
+			embedSize := nEmbd * int32(nTokens)
+			embd, err := mtmd.GetOutputEmbd(mtmdCtx, embedSize)
+			if err != nil {
+				return 0, nil, fmt.Errorf("imc-media-cache: get audio embeddings chunk %d: %w", i, err)
+			}
+
+			// Audio uses standard linear positioning (not M-RoPE).
+			nDecoded, err := m.decodeEmbeddingsIntoCache(embd, nEmbd, int32(nTokens), seqID, pos, useNonCausal)
+			if err != nil {
+				return 0, nil, fmt.Errorf("imc-media-cache: decode audio embeddings chunk %d: %w", i, err)
+			}
+			pos += nDecoded
+			mediaKVCounts = append(mediaKVCounts, nDecoded)
+		}
+	}
+
+	m.log(ctx, "imc-media-cache", "status", "complete", "seq", seqID,
+		"total_kv_positions", pos, "num_chunks", numChunks)
+
+	return pos, mediaKVCounts, nil
+}
+
+// decodeEmbeddingsIntoCache decodes embeddings into a KV cache sequence with
+// standard linear positioning. Returns the number of KV positions consumed.
+func (m *Model) decodeEmbeddingsIntoCache(embd []float32, nEmbd, nTokens int32, seqID llama.SeqId, startPos int, useNonCausal bool) (int, error) {
+	nBatch := int32(m.cfg.NBatch())
+	if nBatch <= 0 {
+		nBatch = 512
+	}
+
+	m.decodeMu.Lock()
+	defer m.decodeMu.Unlock()
+
+	if useNonCausal {
+		llama.SetCausalAttn(m.lctx, false)
+		defer llama.SetCausalAttn(m.lctx, true)
+	}
+
+	pos := startPos
+
+	for start := int32(0); start < nTokens; start += nBatch {
+		end := min(start+nBatch, nTokens)
+		batchN := end - start
+
+		batch := llama.BatchInit(batchN, nEmbd, 1)
+
+		embdSlice := unsafeSlice(batch.Embd, int(batchN*nEmbd))
+		copy(embdSlice, embd[start*nEmbd:end*nEmbd])
+
+		posSlice := unsafeSlice(batch.Pos, int(batchN))
+		nSeqIDSlice := unsafeSlice(batch.NSeqId, int(batchN))
+		seqIDPtrs := unsafeSlice(batch.SeqId, int(batchN))
+		logitsSlice := unsafeSlice(batch.Logits, int(batchN))
+
+		for i := range batchN {
+			posSlice[i] = llama.Pos(pos + int(i))
+			nSeqIDSlice[i] = 1
+			*seqIDPtrs[i] = seqID
+			logitsSlice[i] = 0
+		}
+
+		batch.NTokens = batchN
+
+		ret, err := llama.Decode(m.lctx, batch)
+		if err == nil && ret == 0 {
+			llama.Synchronize(m.lctx)
+		}
+		llama.BatchFree(batch)
+
+		if err != nil || ret != 0 {
+			return 0, decodeError(ret, err)
+		}
+
+		pos += int(batchN)
+	}
+
+	return int(nTokens), nil
+}
+
+// decodeEmbeddingsMRoPEIntoCache decodes embeddings with M-RoPE 2D positioning
+// into a KV cache sequence. Returns the number of KV positions consumed.
+func (m *Model) decodeEmbeddingsMRoPEIntoCache(embd []float32, nEmbd, nTokens, nx, ny int32, seqID llama.SeqId, startPos int, useNonCausal bool) (int, error) {
+	nBatch := int32(m.cfg.NBatch())
+	if nBatch <= 0 {
+		nBatch = 512
+	}
+
+	// Pre-compute the full 4D position array for all tokens.
+	fullPosData := make([]llama.Pos, nTokens*4)
+	pos0 := llama.Pos(startPos)
+	for y := range ny {
+		for x := range nx {
+			i := y*nx + x
+			if i >= nTokens {
+				break
+			}
+			fullPosData[i] = pos0 + llama.Pos(i)
+			fullPosData[i+nTokens] = pos0 + llama.Pos(y)
+			fullPosData[i+nTokens*2] = pos0 + llama.Pos(x)
+			fullPosData[i+nTokens*3] = 0
+		}
+	}
+
+	m.decodeMu.Lock()
+	defer m.decodeMu.Unlock()
+
+	if useNonCausal {
+		llama.SetCausalAttn(m.lctx, false)
+		defer llama.SetCausalAttn(m.lctx, true)
+	}
+
+	for start := int32(0); start < nTokens; start += nBatch {
+		end := min(start+nBatch, nTokens)
+		batchN := end - start
+
+		batch := llama.BatchInit(batchN, nEmbd, 1)
+
+		// Save original pos pointer so BatchFree doesn't free Go memory.
+		origPos := batch.Pos
+
+		embdSlice := unsafeSlice(batch.Embd, int(batchN*nEmbd))
+		copy(embdSlice, embd[start*nEmbd:end*nEmbd])
+
+		// Build sub-batch position array by gathering from the full array.
+		// llama.cpp expects 4 contiguous planes of batchN positions each.
+		subPosData := make([]llama.Pos, batchN*4)
+		for i := range batchN {
+			subPosData[i] = fullPosData[start+i]
+			subPosData[i+batchN] = fullPosData[start+i+nTokens]
+			subPosData[i+batchN*2] = fullPosData[start+i+nTokens*2]
+			subPosData[i+batchN*3] = fullPosData[start+i+nTokens*3]
+		}
+		batch.Pos = &subPosData[0]
+
+		nSeqIDSlice := unsafeSlice(batch.NSeqId, int(batchN))
+		seqIDPtrs := unsafeSlice(batch.SeqId, int(batchN))
+		logitsSlice := unsafeSlice(batch.Logits, int(batchN))
+
+		for i := range batchN {
+			nSeqIDSlice[i] = 1
+			*seqIDPtrs[i] = seqID
+			logitsSlice[i] = 0
+		}
+
+		batch.NTokens = batchN
+
+		ret, err := llama.Decode(m.lctx, batch)
+		if err == nil && ret == 0 {
+			llama.Synchronize(m.lctx)
+		}
+		runtime.KeepAlive(subPosData)
+
+		batch.Pos = origPos
+		llama.BatchFree(batch)
+
+		if err != nil || ret != 0 {
+			return 0, decodeError(ret, err)
+		}
+	}
+
+	return int(nTokens), nil
+}
+
+// decodeTextMRoPEIntoCache decodes text tokens with M-RoPE 4D positioning
+// into a KV cache sequence. Returns the number of KV positions consumed.
+func (m *Model) decodeTextMRoPEIntoCache(tokens []llama.Token, seqID llama.SeqId, startPos int) (int, error) {
+	n := int32(len(tokens))
+	if n == 0 {
+		return 0, nil
+	}
+
+	nBatch := int32(m.cfg.NBatch())
+	if nBatch <= 0 {
+		nBatch = 512
+	}
+
+	m.decodeMu.Lock()
+	defer m.decodeMu.Unlock()
+
+	pos := startPos
+
+	for start := int32(0); start < n; start += nBatch {
+		end := min(start+nBatch, n)
+		batchN := end - start
+
+		batch := llama.BatchInit(batchN, 0, 1)
+
+		// Save original pos pointer.
+		origPos := batch.Pos
+
+		tokenSlice := unsafe.Slice(batch.Token, int(batchN))
+		copy(tokenSlice, tokens[start:end])
+
+		// Allocate 4D position array for M-RoPE.
+		posData := make([]llama.Pos, batchN*4)
+		for i := range batchN {
+			posData[i] = llama.Pos(pos + int(i))
+			posData[i+batchN] = 0
+			posData[i+batchN*2] = 0
+			posData[i+batchN*3] = 0
+		}
+		batch.Pos = &posData[0]
+
+		nSeqIDSlice := unsafe.Slice(batch.NSeqId, int(batchN))
+		seqIDPtrs := unsafe.Slice(batch.SeqId, int(batchN))
+		logitsSlice := unsafe.Slice(batch.Logits, int(batchN))
+
+		for i := range batchN {
+			nSeqIDSlice[i] = 1
+			*seqIDPtrs[i] = seqID
+			logitsSlice[i] = 0
+		}
+
+		batch.NTokens = batchN
+
+		ret, err := llama.Decode(m.lctx, batch)
+		if err == nil && ret == 0 {
+			llama.Synchronize(m.lctx)
+		}
+		runtime.KeepAlive(posData)
+
+		batch.Pos = origPos
+		llama.BatchFree(batch)
+
+		if err != nil || ret != 0 {
+			return 0, decodeError(ret, err)
+		}
+
+		pos += int(batchN)
+	}
+
+	return int(n), nil
+}

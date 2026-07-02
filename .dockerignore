@@ -1,0 +1,45 @@
+# =============================================================================
+# .dockerignore
+#
+# Keeps the build context small for `docker build` / `docker buildx build`.
+# Anything matched here is NOT sent to the Docker daemon as part of the
+# context. Files are still re-included where the Dockerfile copies them
+# explicitly (this only controls what `COPY .` and friends can see).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Version control & IDE state
+# -----------------------------------------------------------------------------
+.git
+.gitignore
+.githooks
+.github
+.idea
+.vscode
+.DS_Store
+*.swp
+*.swo
+*~
+
+# -----------------------------------------------------------------------------
+# Local environment / secrets
+# -----------------------------------------------------------------------------
+.env
+.envrc
+.env.*
+*.pem
+*.key
+
+
+# -----------------------------------------------------------------------------
+# Go build outputs / test artifacts
+# -----------------------------------------------------------------------------
+**/*.test
+**/*.prof
+**/*.out
+**/*.cover
+**/coverage.txt
+**/coverage.html
+**/dist
+**/bin
+vendor

@@ -3,8 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ardanlabs/kronk/sdk/kronk/model"
@@ -16,6 +19,7 @@ import (
 	"github.com/leogoesger/lead-funnel/internal/logger"
 	"github.com/leogoesger/lead-funnel/internal/migrate"
 	"github.com/leogoesger/lead-funnel/internal/rag"
+	"github.com/leogoesger/lead-funnel/internal/web"
 	"github.com/pkg/errors"
 )
 
@@ -38,34 +42,86 @@ func run(ctx context.Context) int {
 		return 1
 	}
 
-	db, err := initDB(ctx, &cfg)
+	db, err := initDB(&cfg)
 	if err != nil {
-		log.Error(ctx, "unable to connect to postgres database: %v\n", err)
+		log.Error(ctx, "unable to connect to postgres database", "err", err)
 		return 1
 	}
 	defer db.Close()
 
 	ragSystem, err := initRagSystem(ctx, &cfg)
 	if err != nil {
-		log.Error(ctx, "unable to create RAG system: %v\n", err)
+		log.Error(ctx, "unable to create RAG system", "err", err)
 		return 1
 	}
 
 	llmClient, err := initLLM(ctx, &cfg)
 	if err != nil {
-		log.Error(ctx, "unable to create LLM client: %v\n", err)
+		log.Error(ctx, "unable to create LLM client", "err", err)
 		return 1
 	}
 
 	if err := testllm(ctx, llmClient, log, ragSystem); err != nil {
-		log.Error(ctx, "unable to test LLM client: %v\n", err)
+		log.Error(ctx, "unable to test LLM client", "err", err)
 		return 1
+	}
+
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+
+	cfgMux := web.MuxConfig{
+		Log: log,
+		DB:  db,
+	}
+
+	webAPI := web.WebAPI(cfgMux,
+		Routes(),
+		web.WithCORS(cfg.Web.CORSAllowedOrigins),
+	)
+
+	api := http.Server{
+		Addr:         cfg.Web.APIHost,
+		Handler:      webAPI,
+		ReadTimeout:  cfg.Web.ReadTimeout,
+		WriteTimeout: cfg.Web.WriteTimeout,
+		IdleTimeout:  cfg.Web.IdleTimeout,
+		ErrorLog:     logger.NewStdLogger(log, logger.LevelError),
+	}
+
+	serverErrors := make(chan error, 1)
+
+	go func() {
+		log.Info(ctx, "startup", "status", "api router started", "host", api.Addr)
+
+		serverErrors <- api.ListenAndServe()
+	}()
+
+	// -------------------------------------------------------------------------
+	// Shutdown
+
+	select {
+	case err := <-serverErrors:
+		log.Error(ctx, "server error", "err", err)
+		return 1
+
+	case sig := <-shutdown:
+		log.Info(ctx, "shutdown", "status", "shutdown started", "signal", sig)
+
+		ctx, cancel := context.WithTimeout(ctx, cfg.Web.ShutdownTimeout)
+		defer cancel()
+
+		if err := api.Shutdown(ctx); err != nil {
+			api.Close()
+			return 1
+		}
+
+		log.Info(ctx, "shutdown", "status", "shutdown complete", "signal", sig)
 	}
 
 	return 0
 }
 
-func initDB(ctx context.Context, cfg *config.ServiceAPI) (*sqlx.DB, error) {
+func initDB(cfg *config.ServiceAPI) (*sqlx.DB, error) {
 	db, err := db.NewPostgres(cfg.DB)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to connect to postgres database")
@@ -76,7 +132,7 @@ func initDB(ctx context.Context, cfg *config.ServiceAPI) (*sqlx.DB, error) {
 		return nil, errors.Wrap(err, "unable to create migration service")
 	}
 
-	if err := migrateService.Migrate(ctx); err != nil {
+	if err := migrateService.Migrate(); err != nil {
 		return nil, errors.Wrap(err, "unable to migrate database")
 	}
 
@@ -98,10 +154,6 @@ func initRagSystem(ctx context.Context, cfg *config.ServiceAPI) (rag.RAG, error)
 
 	if err := ragSystem.LoadDocuments(ctx); err != nil {
 		return nil, errors.Wrap(err, "unable to load documents")
-	}
-
-	if err := ragSystem.Unload(ctx); err != nil {
-		return nil, errors.Wrap(err, "unable to unload RAG system")
 	}
 
 	return ragSystem, nil
@@ -144,18 +196,20 @@ func testllm(ctx context.Context, llmClient *llm.Client, log *logger.Logger, rag
 	}
 
 	var reasoning bool
+	var reason strings.Builder
+	var answer strings.Builder
 	for resp := range ch {
 		switch resp.Choices[0].FinishReason() {
 		case model.FinishReasonError:
 			return errors.New("chat streaming error: " + resp.Choices[0].Delta.Content)
 
 		case model.FinishReasonStop:
-			return errors.New("finish reason stop")
+			log.Info(ctx, "reasoning", "reason", reason.String())
 
 		default:
 			if resp.Choices[0].Delta.Reasoning != "" {
 				reasoning = true
-				log.Info(ctx, "chat streaming reasoning", "content", fmt.Sprintf("\u001b[91m%s\u001b[0m", resp.Choices[0].Delta.Reasoning))
+				reason.WriteString(resp.Choices[0].Delta.Reasoning)
 				continue
 			}
 
@@ -164,9 +218,10 @@ func testllm(ctx context.Context, llmClient *llm.Client, log *logger.Logger, rag
 				continue
 			}
 
-			log.Info(ctx, "chat streaming response", "content", resp.Choices[0].Delta.Content)
+			answer.WriteString(resp.Choices[0].Delta.Content)
 		}
 	}
+	log.Info(ctx, "chat streaming answer", "answer", answer.String())
 	return nil
 }
 

@@ -1,3 +1,14 @@
+-- Initialize database tables on first startup
+-- This is run only if the database is empty
+
+-- Enable extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Set timezone to UTC
+ALTER DATABASE lead_funnel SET TIMEZONE='UTC';
+
+
 -- Create contacts table for lead generation
 CREATE TABLE contacts (
     id BIGSERIAL PRIMARY KEY,

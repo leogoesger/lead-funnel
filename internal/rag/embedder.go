@@ -2,7 +2,6 @@ package rag
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/ardanlabs/kronk/sdk/kronk/model"
@@ -91,7 +90,6 @@ func (e *KronkEmbedder) Embed(ctx context.Context, text string) ([]float32, erro
 }
 
 func (e *KronkEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
-	fmt.Printf("  - EmbedBatch called with %d texts\n", len(texts))
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	d := model.D{
@@ -99,12 +97,11 @@ func (e *KronkEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]flo
 		"input": texts,
 	}
 
-	fmt.Printf("  - Calling client.Embeddings...\n")
 	resp, err := e.client.Embeddings(ctx, d)
 	if err != nil {
 		return nil, err
 	}
-	fmt.Printf("  - Got response with %d embeddings\n", len(resp.Data))
+
 	var embeddings [][]float32
 	for i := range resp.Data {
 		embeddings = append(embeddings, resp.Data[i].Embedding)

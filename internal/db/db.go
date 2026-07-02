@@ -10,10 +10,10 @@ import (
 )
 
 type Config struct {
-	Address  string `required:"true" split_words:"true" desc:"HOST:PORT - if PORT is omitted it will default to 5432"`
-	Name     string `required:"true" split_words:"true" desc:"Database name"`
-	Username string `required:"true" split_words:"true"`
-	Password string `required:"true" split_words:"true"`
+	Address  string `default:"funneldb:5432" split_words:"true" desc:"HOST:PORT - if PORT is omitted it will default to 5432"`
+	Name     string `default:"lead_funnel" split_words:"true" desc:"Database name"`
+	Username string `default:"root" split_words:"true" desc:"Database user"`
+	Password string `required:"true" split_words:"true" desc:"Database password"`
 }
 
 func NewPostgres(cfg *Config) (*sqlx.DB, error) {
