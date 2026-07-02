@@ -65,7 +65,6 @@ type DocumentLoader interface {
 // TextChunker splits text into manageable chunks
 type TextChunker interface {
 	Chunk(text string) ([]string, error)
-	ChunkWithOverlap(text string, chunkSize, overlap int) ([]string, error)
 }
 
 // VectorStore handles embedding storage and retrieval
@@ -177,7 +176,7 @@ func (r *ragImpl) ProcessDocument(ctx context.Context, reader io.Reader, filenam
 // StoreDocument processes, chunks, embeds, and stores a document
 func (r *ragImpl) StoreDocument(ctx context.Context, doc *Document) error {
 	// Chunk the document
-	chunks, err := r.chunker.ChunkWithOverlap(doc.Content, 1000, 200)
+	chunks, err := r.chunker.Chunk(doc.Content)
 	if err != nil {
 		return fmt.Errorf("failed to chunk document: %w", err)
 	}

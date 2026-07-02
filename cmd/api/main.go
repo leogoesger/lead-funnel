@@ -195,7 +195,6 @@ func testllm(ctx context.Context, llmClient *llm.Client, log *logger.Logger, rag
 		return errors.Wrap(err, "chat streaming")
 	}
 
-	var reasoning bool
 	var reason strings.Builder
 	var answer strings.Builder
 	for resp := range ch {
@@ -208,17 +207,12 @@ func testllm(ctx context.Context, llmClient *llm.Client, log *logger.Logger, rag
 
 		default:
 			if resp.Choices[0].Delta.Reasoning != "" {
-				reasoning = true
 				reason.WriteString(resp.Choices[0].Delta.Reasoning)
-				continue
 			}
 
-			if reasoning {
-				reasoning = false
-				continue
+			if resp.Choices[0].Delta.Content != "" {
+				answer.WriteString(resp.Choices[0].Delta.Content)
 			}
-
-			answer.WriteString(resp.Choices[0].Delta.Content)
 		}
 	}
 	log.Info(ctx, "chat streaming answer", "answer", answer.String())

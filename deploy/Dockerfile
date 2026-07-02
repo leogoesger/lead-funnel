@@ -1,24 +1,53 @@
-# Build stage
-FROM golang:1.26-trixie AS builder
+# --------------------------------------------------------------------
+# Build + install Kronk
+# --------------------------------------------------------------------
+FROM golang:1.26-bookworm AS builder
 
 WORKDIR /app
 
-# Copy go mod files
 COPY go.mod go.sum ./
 RUN go mod download
 
 RUN go install github.com/ardanlabs/kronk/cmd/kronk@latest
 
-RUN kronk libs --install --local --os linux --arch arm64 --processor cpu
+RUN kronk libs --install \
+    --local \
+    --os linux \
+    --arch arm64 \
+    --processor cpu
 
-# Copy source code
 COPY . .
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o api ./cmd/api
+RUN go build -o api ./cmd/api
 
-# Expose port
+# --------------------------------------------------------------------
+# Runtime
+# --------------------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update && \
+    apt-get install -y \
+        ca-certificates \
+        libstdc++6 \
+        libgomp1 \
+        libgcc-s1 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Your application
+COPY --from=builder /app/api .
+
+# Application assets
+COPY --from=builder /app/migrations ./migrations
+COPY --from=builder /app/static ./static
+
+# Kronk runtime
+COPY --from=builder /root/.kronk /root/.kronk
+
+# Kronk executable (optional, if you want it available)
+COPY --from=builder /go/bin/kronk /usr/local/bin/kronk
+
 EXPOSE 8080
 
-# Run the application
 CMD ["./api"]
